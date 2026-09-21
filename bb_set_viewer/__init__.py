@@ -2233,7 +2233,16 @@ CLASSES = (
 )
 
 
+_OWNS = {"registered": False}      # this copy registered the tools (another copy may have)
+
+
 def register():
+    # One copy only: the extension, an old single-file install, or the copy embedded in a set
+    # file. Whichever loads second stands aside instead of failing on duplicate classes.
+    if hasattr(bpy.types.Scene, "bb_sv"):
+        print("BB Set Viewer: another copy is already active - this one stays idle")
+        return
+    _OWNS["registered"] = True
     for c in CLASSES:
         bpy.utils.register_class(c)
     bpy.types.Scene.bb_sv = PointerProperty(type=BBSV_Props)
@@ -2244,6 +2253,9 @@ def register():
 
 
 def unregister():
+    if not _OWNS["registered"]:
+        return
+    _OWNS["registered"] = False
     if _OVERLAY["handle"] is not None:
         bpy.types.SpaceView3D.draw_handler_remove(_OVERLAY["handle"], "WINDOW")
         _OVERLAY["handle"] = None

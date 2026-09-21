@@ -1,0 +1,30 @@
+{
+  "version": "v1",
+  "blocklist": [],
+  "data": [
+    {
+      "schema_version": "1.0.0",
+      "id": "bb_set_viewer",
+      "name": "BB Set Viewer",
+      "tagline": "Game-style walk and one-panel camera for film set previs",
+      "version": "2.6.0",
+      "type": "add-on",
+      "maintainer": "Lakao456",
+      "license": [
+        "SPDX:GPL-2.0-or-later"
+      ],
+      "blender_version_min": "4.2.0",
+      "website": "https://github.com/Lakao456/bb-set-viewer",
+      "permissions": {
+        "files": "Save captured stills and camera settings next to the set file"
+      },
+      "tags": [
+        "3D View",
+        "Camera"
+      ],
+      "archive_url": "./bb_set_viewer-2.6.0.zip",
+      "archive_size": 22282,
+      "archive_hash": "sha256:677946569ee1051e7a41304cca13e5e8f1398d556240409b40286d4698dfb22c"
+    }
+  ]
+}
