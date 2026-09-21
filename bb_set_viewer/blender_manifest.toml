@@ -1,0 +1,15 @@
+schema_version = "1.0.0"
+
+id = "bb_set_viewer"
+version = "2.6.0"
+name = "BB Set Viewer"
+tagline = "Game-style walk and one-panel camera for film set previs"
+maintainer = "Lakao456"
+type = "add-on"
+website = "https://github.com/Lakao456/bb-set-viewer"
+tags = ["3D View", "Camera"]
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-2.0-or-later"]
+
+[permissions]
+files = "Save captured stills and camera settings next to the set file"
