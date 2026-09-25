@@ -38,6 +38,8 @@ v2.5.1: Preview had NO lights in Artist/Easy Mode - the stripped view hid the
 v2.5.2: one file carries both modes - switch between Easy and Artist Mode in one click
      (Easy: More > Switch to Artist Mode; Artist: Panel Setup > Switch to Easy Mode).
 v2.6: Easy Mode gets the Fast / Preview look buttons.
+v2.7: Wire look in both modes - a readable wireframe (a colour per object on a dark
+     background, no X-ray), toggled off again back to the look it came from.
 
   4. Easy Mode - one panel, one camera. The viewport IS the camera: Walk moves
              it, sliders set focal length, focus distance, depth of field and
@@ -70,7 +72,7 @@ from mathutils import Euler, Matrix, Vector
 bl_info = {
     "name": "BB Set Viewer",
     "author": "Beta Builder",
-    "version": (2, 6, 0),
+    "version": (2, 7, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > BB Set",
     "description": "Game-style WASD navigation and panel-driven camera control",
@@ -236,6 +238,7 @@ class BBSV_Props(PropertyGroup):
     show_frame: BoolProperty(name="Framing", default=True)
     show_parts: BoolProperty(name="Show / Hide Set Parts", default=True)
     show_look: BoolProperty(name="Look", default=True)
+    look_before_wire: StringProperty(default="MATERIAL", options={"HIDDEN"})
     active_cam: StringProperty(name="Camera", default="")
     focus_on_add: BoolProperty(
         name="With Focus Point",
@@ -841,10 +844,46 @@ class BBSV_OT_set_look(Operator):
         area = _view3d_area(context)
         if area is None:
             return {"CANCELLED"}
+        p = context.scene.bb_sv
         sh = area.spaces.active.shading
+        if self.mode == "WIREFRAME":
+            if sh.type == "WIREFRAME":                       # pressing Wire again goes back
+                self.mode = p.look_before_wire or "MATERIAL"
+            else:
+                p.look_before_wire = sh.type
+                sh.type = "WIREFRAME"
+                _wire_look(sh)
+                return {"FINISHED"}
         sh.type = self.mode
+        _plain_background(sh)
         _scene_lighting(sh)
         return {"FINISHED"}
+
+
+def _enum_ok(owner, prop, value):
+    """True if this Blender build offers that enum value (identifiers move between versions)."""
+    try:
+        return value in {i.identifier for i in owner.bl_rna.properties[prop].enum_items}
+    except Exception:
+        return False
+
+
+def _wire_look(shading):
+    """A wireframe you can actually read: one colour per object, dark background, no X-ray.
+    Blender's default is near-black wires on mid-grey, which shows almost nothing."""
+    if _enum_ok(shading, "wireframe_color_type", "RANDOM"):
+        shading.wireframe_color_type = "RANDOM"
+    for attr in ("show_xray", "show_xray_wireframe"):        # see-through is a separate thing
+        if hasattr(shading, attr):
+            setattr(shading, attr, False)
+    if _enum_ok(shading, "background_type", "VIEWPORT"):
+        shading.background_type = "VIEWPORT"
+        shading.background_color = (0.045, 0.045, 0.055)
+
+
+def _plain_background(shading):
+    if _enum_ok(shading, "background_type", "THEME"):
+        shading.background_type = "THEME"
 
 
 def _scene_lighting(shading):
@@ -1846,7 +1885,7 @@ class BBSV_PT_easy(Panel):
         current = area.spaces.active.shading.type if area else ""
         row = lay.row(align=True)
         row.scale_y = 1.3
-        for label, mode in (("Fast", "SOLID"), ("Preview", "MATERIAL")):
+        for label, mode in (("Fast", "SOLID"), ("Preview", "MATERIAL"), ("Wire", "WIREFRAME")):
             row.operator("bb_sv.set_look", text=label, depress=current == mode).mode = mode
         lay.separator()
 
@@ -2159,7 +2198,7 @@ class BBSV_PT_look(_BBPanel, Panel):
         current = area.spaces.active.shading.type if area else ""
         row = self.layout.row(align=True)
         row.scale_y = 1.3
-        for label, mode in (("Fast", "SOLID"), ("Preview", "MATERIAL")):
+        for label, mode in (("Fast", "SOLID"), ("Preview", "MATERIAL"), ("Wire", "WIREFRAME")):
             row.operator("bb_sv.set_look", text=label, depress=current == mode).mode = mode
         self.layout.label(text="For final quality, use Render Still in Capture", icon="INFO")
 
