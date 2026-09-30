@@ -72,7 +72,7 @@ from mathutils import Euler, Matrix, Vector
 bl_info = {
     "name": "BB Set Viewer",
     "author": "Beta Builder",
-    "version": (2, 7, 0),
+    "version": (2, 8, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > BB Set",
     "description": "Game-style WASD navigation and panel-driven camera control",
@@ -184,6 +184,17 @@ def _fstop_set(self, v):
         d.dof.aperture_fstop = v
 
 
+def _lights_update(self, context):
+    """Push the toggle out to every 3D view showing this scene, so the viewport agrees with
+    the button whichever mode we are in."""
+    for window in context.window_manager.windows:
+        if window.scene is not self.id_data:
+            continue
+        for area in window.screen.areas:
+            if area.type == "VIEW_3D":
+                _scene_lighting(area.spaces.active.shading, self.scene_lights)
+
+
 class BBSV_Props(PropertyGroup):
     speed: FloatProperty(
         name="Speed",
@@ -239,6 +250,12 @@ class BBSV_Props(PropertyGroup):
     show_parts: BoolProperty(name="Show / Hide Set Parts", default=True)
     show_look: BoolProperty(name="Look", default=True)
     look_before_wire: StringProperty(default="MATERIAL", options={"HIDDEN"})
+    scene_lights: BoolProperty(
+        name="Set Lights",
+        description="Light Preview with the set's own lights and world. Turn it off for "
+                    "Blender's studio light, which lights everything evenly and ignores the set",
+        default=True, update=_lights_update,
+    )
     active_cam: StringProperty(name="Camera", default="")
     focus_on_add: BoolProperty(
         name="With Focus Point",
@@ -856,7 +873,7 @@ class BBSV_OT_set_look(Operator):
                 return {"FINISHED"}
         sh.type = self.mode
         _plain_background(sh)
-        _scene_lighting(sh)
+        _scene_lighting(sh, p.scene_lights)
         return {"FINISHED"}
 
 
@@ -886,12 +903,13 @@ def _plain_background(shading):
         shading.background_type = "THEME"
 
 
-def _scene_lighting(shading):
-    """Preview (and Rendered) use the set's own lights and world, never Blender's studio
-    preview - otherwise the lighting the set was built with never shows."""
+def _scene_lighting(shading, on=True):
+    """Preview (and Rendered) use the set's own lights and world, not Blender's studio
+    preview - otherwise the lighting the set was built with never shows. Off is the Set
+    Lights toggle: Blender's studio light, for reading shapes in an unlit set."""
     for attr in ("use_scene_lights", "use_scene_world", "use_scene_lights_render", "use_scene_world_render"):
         if hasattr(shading, attr):
-            setattr(shading, attr, True)
+            setattr(shading, attr, on)
 
 
 def _layer_coll(lc, name):
@@ -1526,7 +1544,7 @@ def enter_artist_mode(window, easy=None):
     space = area.spaces.active
     _style_view(scene, space, True)
     space.show_object_viewport_light = True     # files stripped by v2.5 or earlier saved it off
-    _scene_lighting(space.shading)
+    _scene_lighting(space.shading, scene.bb_sv.scene_lights)
     _lock_set(scene, True)
     _ARTIST["on"] = True
     _ARTIST["easy"] = bool(easy)
@@ -1795,7 +1813,7 @@ def _easy_setup(window, area):
     eye = rv3d.view_location + quat @ Vector((0.0, 0.0, rv3d.view_distance))
     easy_camera(window.scene, eye, quat)
     space.shading.type = "MATERIAL"
-    _scene_lighting(space.shading)
+    _scene_lighting(space.shading, window.scene.bb_sv.scene_lights)
     space.overlay.show_extras = False           # no light or camera outlines over the shot
     rv3d.view_perspective = "CAMERA"
     _fit_camera(window, area)
@@ -1887,6 +1905,10 @@ class BBSV_PT_easy(Panel):
         row.scale_y = 1.3
         for label, mode in (("Fast", "SOLID"), ("Preview", "MATERIAL"), ("Wire", "WIREFRAME")):
             row.operator("bb_sv.set_look", text=label, depress=current == mode).mode = mode
+        sub = lay.row()
+        sub.scale_y = 1.3
+        sub.enabled = current in {"MATERIAL", "RENDERED"}       # the flags only bite in Preview
+        sub.prop(p, "scene_lights", toggle=True, icon="LIGHT")
         lay.separator()
 
         lay.prop(p, "lens_slider", slider=True)
@@ -2200,6 +2222,9 @@ class BBSV_PT_look(_BBPanel, Panel):
         row.scale_y = 1.3
         for label, mode in (("Fast", "SOLID"), ("Preview", "MATERIAL"), ("Wire", "WIREFRAME")):
             row.operator("bb_sv.set_look", text=label, depress=current == mode).mode = mode
+        sub = self.layout.row()
+        sub.enabled = current in {"MATERIAL", "RENDERED"}       # the flags only bite in Preview
+        sub.prop(context.scene.bb_sv, "scene_lights", toggle=True, icon="LIGHT")
         self.layout.label(text="For final quality, use Render Still in Capture", icon="INFO")
 
 
