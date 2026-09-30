@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "bb_set_viewer"
-version = "2.8.0"
+version = "2.9.0"
 name = "BB Set Viewer"
 tagline = "Game-style walk and one-panel camera for film set previs"
 maintainer = "Lakao456"

@@ -3,7 +3,7 @@
 
 Built for team members who are not Blender users. Two jobs:
 
-  1. Walk  - a Minecraft-spectator flythrough. Mouse looks, WASD moves,
+  1. Walk  - a Minecraft-spectator flythrough. Mouse looks, WASD or the arrows move,
              Space/Ctrl rise and fall, Shift sprints. Movement is *state*
              based: you move while a key is held and stop the instant it is
              released. Blender's native fly mode is impulse based, which is
@@ -40,6 +40,10 @@ v2.5.2: one file carries both modes - switch between Easy and Artist Mode in one
 v2.6: Easy Mode gets the Fast / Preview look buttons.
 v2.7: Wire look in both modes - a readable wireframe (a colour per object on a dark
      background, no X-ray), toggled off again back to the look it came from.
+v2.8: Set Lights toggle in both modes - the set's own lights and world, or Blender's
+     studio light. Saved with the file, and a mode switch no longer forces it back on.
+v2.9 (30 Sep 2026): shortcuts in both modes - the arrow keys walk like WASD, C captures,
+     and 1 to 6 are the focal lengths (18, 24, 35, 50, 85, 135 mm), including mid-walk.
 
   4. Easy Mode - one panel, one camera. The viewport IS the camera: Walk moves
              it, sliders set focal length, focus distance, depth of field and
@@ -72,7 +76,7 @@ from mathutils import Euler, Matrix, Vector
 bl_info = {
     "name": "BB Set Viewer",
     "author": "Beta Builder",
-    "version": (2, 8, 0),
+    "version": (2, 9, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > BB Set",
     "description": "Game-style WASD navigation and panel-driven camera control",
@@ -89,6 +93,11 @@ MOVE_KEYS = {
     "S": Vector((0.0, 0.0, 1.0)),
     "A": Vector((-1.0, 0.0, 0.0)),
     "D": Vector((1.0, 0.0, 0.0)),
+    # the arrow keys do exactly what WASD does, for anyone who reaches for them
+    "UP_ARROW": Vector((0.0, 0.0, -1.0)),
+    "DOWN_ARROW": Vector((0.0, 0.0, 1.0)),
+    "LEFT_ARROW": Vector((-1.0, 0.0, 0.0)),
+    "RIGHT_ARROW": Vector((1.0, 0.0, 0.0)),
 }
 # W A S D stay on the floor plane; height changes only with Space (up) and
 # Ctrl (down), so looking down and pressing W never sinks you into the floor.
@@ -429,9 +438,12 @@ class BBSV_OT_flythrough(Operator):
         return {"RUNNING_MODAL"}
 
     def _set_header(self):
+        cam = _active_cam(bpy.context)
+        lens = "   %d mm (1-6)" % round(cam.data.lens) if cam is not None else ""
         self.area.header_text_set(
-            "Walk:  WASD move   Space up   Ctrl down   Shift sprint   "
-            "Wheel speed %.1f m/s   F or Esc finish   Enter finish + lock   Right-click undo" % self.props.speed
+            "Walk:  WASD or arrows move   Space up   Ctrl down   Shift sprint%s   "
+            "Wheel speed %.1f m/s   F or Esc finish   Enter finish + lock   Right-click undo"
+            % (lens, self.props.speed)
         )
 
     def _finish(self, context, cancel=False, lock=False):
@@ -460,6 +472,15 @@ class BBSV_OT_flythrough(Operator):
             return self._finish(context)
         if event.type == "RIGHTMOUSE" and event.value == "PRESS":
             return self._finish(context, cancel=True)
+
+        # 1-6 change the lens without leaving the walk, so the shot can be framed
+        # while moving. The modal sees keys before any keymap does.
+        if event.value == "PRESS" and event.type in LENS_BY_KEY:
+            cam = _active_cam(context)
+            if cam is not None and not _is_locked(cam):
+                cam.data.lens = LENS_BY_KEY[event.type]
+                self._set_header()
+            return {"RUNNING_MODAL"}
 
         # Speed on the wheel, so the same controls suit a desk and a stadium.
         if event.type == "WHEELUPMOUSE":
@@ -764,6 +785,10 @@ class BBSV_OT_stand_on_floor(Operator):
 # ---------------------------------------------------------------------------
 
 LENS_PRESETS = (18, 24, 35, 50, 85, 135)
+# The number keys pick those presets in order: 1 is 18 mm, 6 is 135 mm. Numpad too,
+# so a keyboard with a numpad works either way.
+LENS_BY_KEY = dict(zip(("ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX"), LENS_PRESETS))
+LENS_BY_KEY.update(zip(("NUMPAD_%d" % i for i in range(1, len(LENS_PRESETS) + 1)), LENS_PRESETS))
 ASPECTS = (  # label, width, height
     ("16:9", 1920, 1080),
     ("2.39:1", 1920, 804),
@@ -1209,7 +1234,7 @@ def _tutorial_seen():
 
 
 TUTORIAL = (
-    ("VIEW_PAN", "Walk", "Press F to walk, F again to stop. Mouse looks, W A S D moves,",
+    ("VIEW_PAN", "Walk", "Press F to walk, F again to stop. Mouse looks, W A S D or the arrow keys move,",
      "Space goes up, Ctrl goes down, hold Shift to move faster."),
     ("OUTLINER_OB_CAMERA", "Make a shot", "Walk to a view you like and click Add Camera Here.",
      "Press 0 to look through it. Press F to walk the camera itself into position."),
@@ -1217,17 +1242,19 @@ TUTORIAL = (
      "The padlock in the camera list unlocks it. Esc stops walking without locking."),
     ("TOOL_SETTINGS", "Fine-tune", "Lens, Focus and Framing sit in the panel on the right.",
      "Right-click while walking undoes the walk. Cmd/Ctrl + Z undoes anything else."),
-    ("RENDER_STILL", "Capture", "Quick Capture saves exactly what you see, instantly.",
+    ("DRIVER_DISTANCE", "Change the lens", "Number keys 1 to 6 are the focal lengths: 18, 24, 35, 50, 85, 135 mm.",
+     "They work while you walk too, so the shot can be framed on the move."),
+    ("RENDER_STILL", "Capture", "Press C, or click Quick Capture, to save exactly what you see.",
      "Render Still gives final quality. Both land in the Captures folder beside this file."),
 )
 
 
 TUTORIAL_EASY = (
-    ("VIEW_PAN", "Walk", "Press F (or click Walk) to move the camera. Mouse looks, W A S D moves,",
+    ("VIEW_PAN", "Walk", "Press F (or click Walk) to move the camera. Mouse looks, W A S D or the arrows move,",
      "Space goes up, Ctrl goes down, Shift is faster. F again to stop."),
     ("TOOL_SETTINGS", "Lens and focus", "Focal Length: small numbers are wide, big numbers are close.",
-     "Depth of Field on, then Focus Distance and F-Stop set what is sharp."),
-    ("RENDER_STILL", "Capture", "Capture saves the picture and the camera settings",
+     "Number keys 1 to 6 jump to 18, 24, 35, 50, 85 and 135 mm, walking or not."),
+    ("RENDER_STILL", "Capture", "Press C, or click Capture, to save the picture and the camera settings",
      "into the Captures folder beside this file."),
 )
 
@@ -1679,6 +1706,48 @@ class BBSV_OT_camera_view_hotkey(Operator):
         return bpy.ops.bb_sv.camera_view()
 
 
+class BBSV_OT_capture_hotkey(Operator):
+    """Capture this shot (C, in Artist and Easy Mode)"""
+
+    bl_idname = "bb_sv.capture_hotkey"
+    bl_label = "Capture"
+    bl_options = {"INTERNAL"}
+
+    @classmethod
+    def poll(cls, context):
+        return _ARTIST["on"]
+
+    def execute(self, context):
+        # C does whatever that mode's Capture button does: the saved shot plus its
+        # settings in Easy Mode, the instant grab in Artist Mode. Render Still stays
+        # a deliberate click - it is the slow one.
+        if _ARTIST.get("easy"):
+            return bpy.ops.bb_sv.easy_capture()
+        return bpy.ops.bb_sv.capture(kind="QUICK")
+
+
+class BBSV_OT_lens_hotkey(Operator):
+    """Pick a focal length with the number keys (Artist and Easy Mode shortcut)"""
+
+    bl_idname = "bb_sv.lens_hotkey"
+    bl_label = "Lens Preset"
+    bl_options = {"INTERNAL"}
+
+    mm: FloatProperty()
+
+    @classmethod
+    def poll(cls, context):
+        return _ARTIST["on"]
+
+    def execute(self, context):
+        cam = _active_cam(context)
+        if cam is None or _refuse_if_locked(self, cam):
+            return {"CANCELLED"}
+        cam.data.lens = self.mm
+        _flash("%d mm" % round(self.mm))
+        return {"FINISHED"}
+
+
 # Keys: everything a stray press could do something with.
 _LETTERS = [chr(c) for c in range(ord("A"), ord("Z") + 1)]
 _DIGITS = ["ZERO", "ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "SEVEN", "EIGHT", "NINE"]
@@ -1707,6 +1776,11 @@ def _allowed_key(event):
         return True                                  # walk
     if t == "ACCENT_GRAVE" and event.shift:
         return True                                  # walk (Blender's own walk key)
+    plain = not (cmd or event.alt or event.shift)
+    if t == "C" and plain:
+        return True                                  # capture
+    if t in LENS_BY_KEY and plain:
+        return True                                  # 1-6 lens presets
     if _ARTIST.get("easy"):
         return False                                 # Easy Mode: no camera list, no locking
     return t in {"ZERO", "NUMPAD_0", "RET", "NUMPAD_ENTER"} and not (cmd or event.alt)
@@ -1734,6 +1808,12 @@ def _register_keymaps():
             _addon_keymaps.append((km, k))
         for key in ("RET", "NUMPAD_ENTER"):
             k = km.keymap_items.new("bb_sv.lock_hotkey", key, "PRESS")
+            _addon_keymaps.append((km, k))
+        k = km.keymap_items.new("bb_sv.capture_hotkey", "C", "PRESS")
+        _addon_keymaps.append((km, k))
+        for key, mm in LENS_BY_KEY.items():
+            k = km.keymap_items.new("bb_sv.lens_hotkey", key, "PRESS")
+            k.properties.mm = mm
             _addon_keymaps.append((km, k))
         # then the blockers, any modifier combination
         for key in _LETTERS + _DIGITS + _FKEYS + _OTHER + _MOUSE:
@@ -1923,7 +2003,7 @@ class BBSV_PT_easy(Panel):
 
         col = lay.column()
         col.scale_y = 2.0
-        col.operator("bb_sv.easy_capture", text="Capture", icon="RENDER_STILL")
+        col.operator("bb_sv.easy_capture", text="Capture  (C)", icon="RENDER_STILL")
         lay.operator("bb_sv.open_captures", text="Open Captures Folder", icon="FILE_FOLDER", emboss=False)
 
 
@@ -1972,7 +2052,7 @@ class BBSV_PT_capture(_BBPanel, Panel):
         col.enabled = cam is not None
         row = col.row(align=True)
         row.scale_y = 1.8
-        row.operator("bb_sv.capture", text="Quick Capture", icon="IMAGE_DATA").kind = "QUICK"
+        row.operator("bb_sv.capture", text="Quick Capture  (C)", icon="IMAGE_DATA").kind = "QUICK"
         row.operator("bb_sv.capture", text="Render Still", icon="RENDER_STILL").kind = "RENDER"
         if cam is None:
             lay.label(text="Add a camera to capture its shot", icon="INFO")
@@ -2125,6 +2205,9 @@ class BBSV_PT_lens(_BBPanel, Panel):
         row = lay.row(align=True)
         for mm in LENS_PRESETS:
             row.operator("bb_sv.set_lens", text=str(mm), depress=abs(data.lens - mm) < 0.5).mm = mm
+        row = lay.row()
+        row.scale_y = 0.6
+        row.label(text="Number keys 1-%d pick these, walking or not" % len(LENS_PRESETS))
         lay.prop(data, "lens", text="Focal Length")
         col = lay.column(align=True)
         col.prop(data, "clip_start", text="Clip Near")
@@ -2274,6 +2357,8 @@ CLASSES = (
     BBSV_OT_blocked,
     BBSV_OT_walk_hotkey,
     BBSV_OT_camera_view_hotkey,
+    BBSV_OT_capture_hotkey,
+    BBSV_OT_lens_hotkey,
     BBSV_OT_lock_camera,
     BBSV_OT_lock_hotkey,
     BBSV_OT_rename_camera,
