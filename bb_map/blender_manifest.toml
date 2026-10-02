@@ -1,0 +1,12 @@
+schema_version = "1.0.0"
+
+id = "bb_map"
+version = "2.0.0"
+name = "BB Map"
+tagline = "Working areas, tiles and level of detail for city map files"
+maintainer = "Lakao456"
+type = "add-on"
+website = "https://github.com/Lakao456/bb-set-viewer"
+tags = ["3D View"]
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-2.0-or-later"]

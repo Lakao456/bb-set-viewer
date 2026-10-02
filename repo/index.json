@@ -4,6 +4,26 @@
   "data": [
     {
       "schema_version": "1.0.0",
+      "id": "bb_map",
+      "name": "BB Map",
+      "tagline": "Working areas, tiles and level of detail for city map files",
+      "version": "2.0.0",
+      "type": "add-on",
+      "maintainer": "Lakao456",
+      "license": [
+        "SPDX:GPL-2.0-or-later"
+      ],
+      "blender_version_min": "4.2.0",
+      "website": "https://github.com/Lakao456/bb-set-viewer",
+      "tags": [
+        "3D View"
+      ],
+      "archive_url": "./bb_map-2.0.0.zip",
+      "archive_size": 6360,
+      "archive_hash": "sha256:24272dcc8c2f4cc4cee85ce29156e3a63df868a31fb12243921eb490924ffaf9"
+    },
+    {
+      "schema_version": "1.0.0",
       "id": "bb_set_viewer",
       "name": "BB Set Viewer",
       "tagline": "Game-style walk and one-panel camera for film set previs",
