@@ -44,6 +44,12 @@ v2.8: Set Lights toggle in both modes - the set's own lights and world, or Blend
      studio light. Saved with the file, and a mode switch no longer forces it back on.
 v2.9 (30 Sep 2026): shortcuts in both modes - the arrow keys walk like WASD, C captures,
      and 1 to 6 are the focal lengths (18, 24, 35, 50, 85, 135 mm), including mid-walk.
+v2.10 (2 Oct 2026): Capture Passes - one press of Capture (or C) saves the look, a blockout,
+     an uncoloured pass, greyscale, wireframe and a real depth map, whichever are ticked.
+     The depth map renders in EEVEE with the Z pass mapped to the set's own near and far
+     (so the sky cannot flatten it) through a colour ramp, saved with the view transform
+     forced to Standard - a film curve turns white into 0.77 and is why depth maps come out
+     grey and flat. Clear All Cameras. Render-based captures force EEVEE: no Cycles.
 
   4. Easy Mode - one panel, one camera. The viewport IS the camera: Walk moves
              it, sliders set focal length, focus distance, depth of field and
@@ -76,7 +82,7 @@ from mathutils import Euler, Matrix, Vector
 bl_info = {
     "name": "BB Set Viewer",
     "author": "Beta Builder",
-    "version": (2, 9, 0),
+    "version": (2, 10, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > BB Set",
     "description": "Game-style WASD navigation and panel-driven camera control",
@@ -294,6 +300,30 @@ class BBSV_Props(PropertyGroup):
     dof_toggle: BoolProperty(
         name="Depth of Field", description="Blur what is nearer or further than the focus distance",
         get=_dof_get, set=_dof_set,
+    )
+    # Capture passes: one press of Capture (or C) saves every pass that is ticked.
+    multi_pass: BoolProperty(
+        name="Capture Passes",
+        description="Save several versions of the same frame at once - the look, a blockout, "
+                    "a depth map and so on. Off saves just what you see",
+        default=False,
+    )
+    pass_look: BoolProperty(name="Look", default=True,
+                            description="The set exactly as you see it now")
+    pass_solid: BoolProperty(name="Blockout", default=False,
+                             description="Solid shading: shapes and staging, no materials")
+    pass_flat: BoolProperty(name="Uncoloured", default=False,
+                            description="One flat colour, flat lighting - pure form, no shading")
+    pass_grey: BoolProperty(name="Greyscale", default=False,
+                            description="The look with the colour taken out")
+    pass_wire: BoolProperty(name="Wireframe", default=False,
+                            description="Edges only, a colour per object")
+    pass_depth: BoolProperty(name="Depth Map", default=False,
+                             description="A real depth map. This one renders the frame in EEVEE, "
+                                         "so it takes a few seconds")
+    depth_near_white: BoolProperty(
+        name="Near is White", default=True,
+        description="White nearest the camera, black furthest away. Off flips it",
     )
     fstop_slider: FloatProperty(
         name="F-Stop", description="Smaller = more blur outside the focus distance",
@@ -1163,6 +1193,279 @@ def _grab_view(context, area, path):
     return True
 
 
+CAPTURE_PASSES = (
+    ("look", "Look", "LIGHT"),
+    ("solid", "Blockout", "SHADING_SOLID"),
+    ("flat", "Uncoloured", "SHADING_RENDERED"),
+    ("grey", "Greyscale", "IMAGE_ZDEPTH"),
+    ("wire", "Wireframe", "SHADING_WIRE"),
+    ("depth", "Depth Map", "MOD_FLUIDSIM"),
+)
+
+
+def _enabled_passes(props):
+    if not props.multi_pass:
+        return ["look"]
+    on = [k for k, _l, _i in CAPTURE_PASSES if getattr(props, "pass_" + k, False)]
+    return on or ["look"]
+
+
+def _pass_path(base, key):
+    if key == "look":
+        return base
+    stem, ext = os.path.splitext(base)
+    return "%s - %s%s" % (stem, key, ext)
+
+
+def _desaturate(path):
+    """Take the colour out of a saved still, keeping what the eye reads as brightness."""
+    try:
+        import numpy as np
+        img = bpy.data.images.load(path, check_existing=False)
+    except Exception:
+        return False                      # no image was opened, so nothing to clean up
+    try:
+        px = np.empty(len(img.pixels), dtype=np.float32)
+        img.pixels.foreach_get(px)
+        px = px.reshape(-1, 4)
+        lum = px[:, 0] * 0.2126 + px[:, 1] * 0.7152 + px[:, 2] * 0.0722
+        px[:, 0] = px[:, 1] = px[:, 2] = lum
+        img.pixels.foreach_set(px.ravel())
+        img.filepath_raw = path
+        img.file_format = "PNG"
+        img.save()
+        return True
+    except Exception:
+        return False
+    finally:
+        bpy.data.images.remove(img)
+
+
+def _force_eevee(scene):
+    """Cycles is not part of this workflow - previews, blocking and reference only."""
+    if scene.render.engine == "BLENDER_EEVEE":
+        return False
+    try:
+        scene.render.engine = "BLENDER_EEVEE"      # dynamic enum: the error lists what is valid
+        return True
+    except TypeError:
+        return False
+
+
+def _depth_range(scene, cam):
+    """Near and far along the camera's view direction, from the set's own bounding box, so the
+    depth map uses its whole range. Without this the sky sits at 10^10 and everything real
+    collapses into the first fraction of the gradient - which is what a flat-looking depth map
+    usually is."""
+    from mathutils import Vector
+    # object matrices can be one step behind after a camera move; without this the range is
+    # measured from where the camera used to be and the whole map comes out flat
+    bpy.context.view_layer.update()
+    forward = (cam.matrix_world.to_3x3() @ Vector((0.0, 0.0, -1.0))).normalized()
+    eye = cam.matrix_world.translation
+    dists = []
+    for o in scene.objects:
+        if o.type != "MESH" or not o.data or not len(o.data.polygons):
+            continue
+        for c in o.bound_box:
+            dists.append((o.matrix_world @ Vector(c) - eye).dot(forward))
+    dists = [d for d in dists if d > 0.0]
+    if not dists:
+        return cam.data.clip_start, min(cam.data.clip_end, 100.0)
+    near = max(cam.data.clip_start, min(dists) * 0.95)
+    far = min(cam.data.clip_end, max(dists) * 1.05)
+    return near, max(near + 0.01, far)
+
+
+def _depth_node_group(scene, near, far, near_white):
+    """Depth pass -> clamped to the set's own near/far -> colour ramp -> out.
+
+    Blender 5's compositor is a node group on the scene; there is no Composite node any more,
+    the group's output is the result. The colour ramp is the shader one, reused here."""
+    name = "BB Depth Map"
+    ng = bpy.data.node_groups.get(name)
+    if ng is not None:
+        bpy.data.node_groups.remove(ng)
+    ng = bpy.data.node_groups.new(name, "CompositorNodeTree")
+    try:
+        ng.interface.new_socket("Image", in_out="OUTPUT", socket_type="NodeSocketColor")
+    except Exception:
+        pass
+
+    rl = ng.nodes.new("CompositorNodeRLayers")
+    rl.scene = scene
+    rl.location = (-600, 0)
+    rng = ng.nodes.new("ShaderNodeMapRange")       # clamped, so the sky lands on 'far'
+    rng.location = (-380, 0)
+    rng.clamp = True
+    rng.inputs["From Min"].default_value = near
+    rng.inputs["From Max"].default_value = far
+    rng.inputs["To Min"].default_value = 0.0
+    rng.inputs["To Max"].default_value = 1.0
+    ramp = ng.nodes.new("ShaderNodeValToRGB")
+    ramp.location = (-160, 0)
+    a, b = (1.0, 0.0) if near_white else (0.0, 1.0)
+    ramp.color_ramp.elements[0].color = (a, a, a, 1.0)
+    ramp.color_ramp.elements[1].color = (b, b, b, 1.0)
+    out = ng.nodes.new("NodeGroupOutput")
+    out.location = (60, 0)
+
+    depth = rl.outputs.get("Depth") or rl.outputs.get("Z")
+    if depth is None:
+        return None
+    ng.links.new(depth, rng.inputs["Value"])
+    ng.links.new(rng.outputs["Result"], ramp.inputs["Factor"])
+    ng.links.new(ramp.outputs["Color"], out.inputs[0])
+    return ng
+
+
+def _render_depth(context, cam, path):
+    """Render the frame in EEVEE and save its depth map. Rendering is the only way to get a
+    depth pass - the viewport cannot hand one over."""
+    scene = context.scene
+    switched = _force_eevee(scene)
+    vl = context.view_layer
+    keep_z, keep_mist = vl.use_pass_z, vl.use_pass_mist
+    vl.use_pass_z = True
+    vl.use_pass_mist = True
+    near, far = _depth_range(scene, cam)
+    if scene.world is not None:
+        scene.world.mist_settings.start = near         # the mist pass, ready for anyone who
+        scene.world.mist_settings.depth = max(0.01, far - near)   # prefers it to raw depth
+    prev_group = getattr(scene, "compositing_node_group", None)
+    ng = _depth_node_group(scene, near, far, scene.bb_sv.depth_near_white)
+    if ng is None:
+        _flash("Could not build the depth map nodes", seconds=4)
+        return False
+    r = scene.render
+    keep = (r.filepath, r.image_settings.file_format, r.image_settings.color_mode)
+    # A depth map must be saved exactly as computed. The default view transform (AgX/Filmic) is
+    # a film response curve for pictures: it bends the gradient and turns white into about 0.77,
+    # which is what makes a depth map come out flat and grey.
+    vs = scene.view_settings
+    keep_view = (vs.view_transform, vs.look, vs.exposure, vs.gamma)
+    try:
+        for name in ("Standard", "Raw"):
+            try:
+                vs.view_transform = name
+                break
+            except TypeError:
+                continue
+        try:
+            vs.look = "None"
+        except TypeError:
+            pass
+        vs.exposure, vs.gamma = 0.0, 1.0
+        scene.compositing_node_group = ng
+        r.filepath = path
+        r.image_settings.file_format = "PNG"
+        r.image_settings.color_mode = "BW"
+        bpy.ops.render.render(write_still=True)        # blocking, so the next pass waits
+    except Exception as exc:
+        _flash("Depth render failed: %s" % exc, seconds=5)
+        return False
+    finally:
+        # put the file's own compositor back: every later render would be a depth map otherwise
+        scene.compositing_node_group = prev_group
+        vs.view_transform, vs.look, vs.exposure, vs.gamma = keep_view
+        r.filepath, r.image_settings.file_format, r.image_settings.color_mode = keep
+        vl.use_pass_z, vl.use_pass_mist = keep_z, keep_mist
+        if switched:
+            _flash("Render engine set to EEVEE for the depth map", seconds=4)
+    return os.path.exists(path)
+
+
+def _capture_pass(context, area, cam, key, path):
+    """One pass. Everything except the depth map is a grab of the viewport, so it is instant."""
+    if key == "depth":
+        return _render_depth(context, cam, path)
+    space = area.spaces.active
+    sh = space.shading
+    keep = (sh.type, sh.light, sh.color_type, sh.single_color[:],
+            sh.background_type, sh.background_color[:], sh.show_xray)
+    try:
+        if key == "solid":
+            sh.type = "SOLID"
+            if _enum_ok(sh, "color_type", "MATERIAL"):
+                sh.color_type = "MATERIAL"
+            if _enum_ok(sh, "light", "STUDIO"):
+                sh.light = "STUDIO"
+        elif key == "flat":
+            sh.type = "SOLID"
+            if _enum_ok(sh, "color_type", "SINGLE"):
+                sh.color_type = "SINGLE"
+                sh.single_color = (0.75, 0.75, 0.75)
+            if _enum_ok(sh, "light", "FLAT"):
+                sh.light = "FLAT"
+        elif key == "wire":
+            sh.type = "WIREFRAME"
+            _wire_look(sh)
+        ok = _grab_view(context, area, path)
+    finally:
+        (sh.type, sh.light, sh.color_type, sh.single_color,
+         sh.background_type, sh.background_color, sh.show_xray) = keep
+    if ok and key == "grey":
+        _desaturate(path)
+    return ok
+
+
+def _capture_all(context, area, cam, base_path):
+    """Save every ticked pass of this frame. Returns the names written."""
+    keys = _enabled_passes(context.scene.bb_sv)
+    written = []
+    for key in keys:
+        path = _pass_path(base_path, key)
+        if _capture_pass(context, area, cam, key, path):
+            written.append(os.path.basename(path))
+    return written
+
+
+class BBSV_OT_clear_cameras(Operator):
+    """Delete every camera in the scene - including any the art team left behind"""
+
+    bl_idname = "bb_sv.clear_cameras"
+    bl_label = "Clear All Cameras"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def invoke(self, context, event):
+        n = sum(1 for o in context.scene.objects if o.type == "CAMERA")
+        if not n:
+            _flash("There are no cameras to clear")
+            return {"CANCELLED"}
+        return context.window_manager.invoke_confirm(
+            self, event, message="Delete all %d camera(s) in this scene?" % n)
+
+    def execute(self, context):
+        gone = 0
+        for o in list(context.scene.objects):
+            if o.type == "CAMERA":
+                data = o.data
+                bpy.data.objects.remove(o)
+                if data is not None and data.users == 0:
+                    bpy.data.cameras.remove(data)
+                gone += 1
+        context.scene.camera = None
+        _flash("Cleared %d camera(s)" % gone, seconds=4)
+        self.report({"INFO"}, "Cleared %d camera(s)" % gone)
+        return {"FINISHED"}
+
+
+def _draw_passes(lay, p):
+    """The pass picker: off, it saves what you see; on, it saves every ticked version."""
+    box = lay.box()
+    box.prop(p, "multi_pass", text="Capture Passes", icon="RENDERLAYERS")
+    if not p.multi_pass:
+        return
+    grid = box.grid_flow(columns=2, even_columns=True, align=True)
+    for key, label, icon in CAPTURE_PASSES:
+        grid.prop(p, "pass_" + key, text=label, icon=icon, toggle=True)
+    if p.pass_depth:
+        box.prop(p, "depth_near_white")
+        row = box.row()
+        row.scale_y = 0.6
+        row.label(text="The depth map renders the frame in EEVEE - a few seconds", icon="INFO")
+
+
 class BBSV_OT_capture(Operator):
     """Save a still of the active camera's shot into the Captures folder next to this file"""
 
@@ -1188,11 +1491,14 @@ class BBSV_OT_capture(Operator):
             return {"CANCELLED"}
         path = _capture_path(cam, self.kind)
         if self.kind == "QUICK":
-            if not _grab_view(context, area, path):
+            written = _capture_all(context, area, cam, path)
+            if not written:
                 return {"CANCELLED"}
-            _flash("Captured: %s" % os.path.basename(path), seconds=5)
-            self.report({"INFO"}, "Captured %s" % path)
+            _flash("Captured %d: %s" % (len(written), ", ".join(written)) if len(written) > 1
+                   else "Captured: %s" % written[0], seconds=5)
+            self.report({"INFO"}, "Captured %s" % ", ".join(written))
             return {"FINISHED"}
+        _force_eevee(scene)          # no Cycles in this workflow
         r = scene.render
         keep = (r.filepath, r.image_settings.file_format)
         r.filepath = path
@@ -1937,7 +2243,8 @@ class BBSV_OT_easy_capture(Operator):
         stamp = time.strftime("%Y-%m-%d %H%M%S")
         base = "Shot %02d - %dmm - %s" % (n, round(cam.data.lens), stamp)
         path = os.path.join(_capture_dir(), base + ".png")
-        if not _grab_view(context, area, path):
+        written = _capture_all(context, area, cam, path)
+        if not written:
             return {"CANCELLED"}
         d = cam.data
         state = {
@@ -1949,12 +2256,13 @@ class BBSV_OT_easy_capture(Operator):
             "depth_of_field": d.dof.use_dof, "focus_distance_m": d.dof.focus_distance,
             "f_stop": d.dof.aperture_fstop,
             "resolution": [scene.render.resolution_x, scene.render.resolution_y],
+            "passes": written,
         }
         with open(os.path.join(_capture_dir(), base + ".json"), "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
         states.append(state)
         scene[EASY_STATES] = json.dumps(states)
-        _flash("Shot %02d saved (picture + camera settings)" % n, seconds=5)
+        _flash("Shot %02d saved (%d file(s) + camera settings)" % (n, len(written)), seconds=5)
         self.report({"INFO"}, "Captured %s" % path)
         return {"FINISHED"}
 
@@ -2001,6 +2309,7 @@ class BBSV_PT_easy(Panel):
         col.prop(p, "fstop_slider", slider=True)
         lay.separator()
 
+        _draw_passes(lay, p)
         col = lay.column()
         col.scale_y = 2.0
         col.operator("bb_sv.easy_capture", text="Capture  (C)", icon="RENDER_STILL")
@@ -2054,6 +2363,7 @@ class BBSV_PT_capture(_BBPanel, Panel):
         row.scale_y = 1.8
         row.operator("bb_sv.capture", text="Quick Capture  (C)", icon="IMAGE_DATA").kind = "QUICK"
         row.operator("bb_sv.capture", text="Render Still", icon="RENDER_STILL").kind = "RENDER"
+        _draw_passes(lay, context.scene.bb_sv)
         if cam is None:
             lay.label(text="Add a camera to capture its shot", icon="INFO")
         else:
@@ -2114,6 +2424,8 @@ class BBSV_PT_cameras(_BBPanel, Panel):
 
         if not cams:
             lay.label(text="No cameras yet - walk to a view, then add one", icon="INFO")
+            if any(o.type == "CAMERA" for o in scene.objects):
+                lay.operator("bb_sv.clear_cameras", text="Clear All Cameras", icon="TRASH")
         else:
             col = lay.box().column(align=True)
             for cam in cams:
@@ -2141,6 +2453,9 @@ class BBSV_PT_cameras(_BBPanel, Panel):
             lay.operator("bb_sv.camera_view", depress=bool(through),
                          text="Looking Through Camera (0)" if through else "Look Through Camera (0)",
                          icon="VIEW_CAMERA")
+        if any(o.type == "CAMERA" for o in scene.objects):
+            lay.separator()
+            lay.operator("bb_sv.clear_cameras", text="Clear All Cameras", icon="TRASH")
 
 
 def _locked_banner(layout, cam):
@@ -2364,6 +2679,7 @@ CLASSES = (
     BBSV_OT_rename_camera,
     BBSV_OT_delete_camera,
     BBSV_OT_capture,
+    BBSV_OT_clear_cameras,
     BBSV_OT_open_captures,
     BBSV_OT_tutorial,
     BBSV_OT_easy_capture,
