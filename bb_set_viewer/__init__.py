@@ -56,6 +56,8 @@ v2.11 (2 Oct 2026): the depth map uses Normalize, so it fits whatever the camera
      turned up, drawn at 2x resolution, then stretched to black ink on white paper. Straight
      out of the viewport it is grey on grey: paper 0.73, darkest lines 0.46, nothing above
      0.73. After the stretch: paper 0.96, lines 0.06.
+v2.12 (2 Oct 2026): the wireframe pass is gone - line art is what it was wanted for, and two
+     similar-sounding passes only cause confusion. Wire is still a look button, as it always was.
 
   4. Easy Mode - one panel, one camera. The viewport IS the camera: Walk moves
              it, sliders set focal length, focus distance, depth of field and
@@ -89,7 +91,7 @@ from mathutils import Euler, Matrix, Vector
 bl_info = {
     "name": "BB Set Viewer",
     "author": "Beta Builder",
-    "version": (2, 11, 0),
+    "version": (2, 12, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > BB Set",
     "description": "Game-style WASD navigation and panel-driven camera control",
@@ -333,8 +335,6 @@ class BBSV_Props(PropertyGroup):
     )
     pass_grey: BoolProperty(name="Greyscale", default=False,
                             description="The look with the colour taken out")
-    pass_wire: BoolProperty(name="Wireframe", default=False,
-                            description="Edges only, a colour per object")
     pass_depth: BoolProperty(name="Depth Map", default=False,
                              description="A real depth map. This one renders the frame in EEVEE, "
                                          "so it takes a few seconds")
@@ -1215,7 +1215,6 @@ CAPTURE_PASSES = (
     ("solid", "Blockout", "SHADING_SOLID"),
     ("lineart", "Line Art", "MOD_LINEART"),
     ("grey", "Greyscale", "IMAGE_ZDEPTH"),
-    ("wire", "Wireframe", "SHADING_WIRE"),
     ("depth", "Depth Map", "MOD_FLUIDSIM"),
 )
 
@@ -1452,9 +1451,6 @@ def _capture_pass(context, area, cam, key, path):
                 sh.light = "STUDIO"
         elif key == "lineart":
             _lineart_look(sh)
-        elif key == "wire":
-            sh.type = "WIREFRAME"
-            _wire_look(sh)
         if key == "lineart":
             render.resolution_percentage = keep_res * context.scene.bb_sv.lineart_scale
         ok = _grab_view(context, area, path)

@@ -1,0 +1,15 @@
+schema_version = "1.0.0"
+
+id = "bb_skp_convert"
+version = "1.0.0"
+name = "BB SketchUp Convert"
+tagline = "Import a SketchUp set one to one, then optimise and organise it"
+maintainer = "Lakao456"
+type = "add-on"
+website = "https://github.com/Lakao456/bb-set-viewer"
+tags = ["Import-Export"]
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-2.0-or-later"]
+
+[permissions]
+files = "Read the .skp and write the .blend and its report"
