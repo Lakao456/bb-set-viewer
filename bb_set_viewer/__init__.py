@@ -50,6 +50,12 @@ v2.10 (2 Oct 2026): Capture Passes - one press of Capture (or C) saves the look,
      (so the sky cannot flatten it) through a colour ramp, saved with the view transform
      forced to Standard - a film curve turns white into 0.77 and is why depth maps come out
      grey and flat. Clear All Cameras. Render-based captures force EEVEE: no Cycles.
+v2.11 (2 Oct 2026): the depth map uses Normalize, so it fits whatever the camera is looking at
+     with nothing to set (the one catch: in an open shot the sky takes the far end). The
+     'uncoloured' pass became a proper LINE ART pass - white paper, cavity and object outlines
+     turned up, drawn at 2x resolution, then stretched to black ink on white paper. Straight
+     out of the viewport it is grey on grey: paper 0.73, darkest lines 0.46, nothing above
+     0.73. After the stretch: paper 0.96, lines 0.06.
 
   4. Easy Mode - one panel, one camera. The viewport IS the camera: Walk moves
              it, sliders set focal length, focus distance, depth of field and
@@ -73,6 +79,7 @@ from bpy.props import (
     BoolProperty,
     EnumProperty,
     FloatProperty,
+    IntProperty,
     PointerProperty,
     StringProperty,
 )
@@ -82,7 +89,7 @@ from mathutils import Euler, Matrix, Vector
 bl_info = {
     "name": "BB Set Viewer",
     "author": "Beta Builder",
-    "version": (2, 10, 0),
+    "version": (2, 11, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > BB Set",
     "description": "Game-style WASD navigation and panel-driven camera control",
@@ -312,8 +319,18 @@ class BBSV_Props(PropertyGroup):
                             description="The set exactly as you see it now")
     pass_solid: BoolProperty(name="Blockout", default=False,
                              description="Solid shading: shapes and staging, no materials")
-    pass_flat: BoolProperty(name="Uncoloured", default=False,
-                            description="One flat colour, flat lighting - pure form, no shading")
+    pass_lineart: BoolProperty(name="Line Art", default=False,
+                               description="A line drawing: flat white paper with the edges of "
+                                           "everything drawn in. Saved at a higher resolution")
+    lineart_scale: IntProperty(
+        name="Line Art Detail", default=2, min=1, max=4,
+        description="How many times the normal resolution the line art is drawn at. Higher "
+                    "means finer, denser lines",
+    )
+    lineart_contrast: FloatProperty(
+        name="Line Art Contrast", default=1.0, min=0.0, max=2.0,
+        description="How hard the lines are pushed towards black and the paper towards white",
+    )
     pass_grey: BoolProperty(name="Greyscale", default=False,
                             description="The look with the colour taken out")
     pass_wire: BoolProperty(name="Wireframe", default=False,
@@ -1196,7 +1213,7 @@ def _grab_view(context, area, path):
 CAPTURE_PASSES = (
     ("look", "Look", "LIGHT"),
     ("solid", "Blockout", "SHADING_SOLID"),
-    ("flat", "Uncoloured", "SHADING_RENDERED"),
+    ("lineart", "Line Art", "MOD_LINEART"),
     ("grey", "Greyscale", "IMAGE_ZDEPTH"),
     ("wire", "Wireframe", "SHADING_WIRE"),
     ("depth", "Depth Map", "MOD_FLUIDSIM"),
@@ -1252,36 +1269,15 @@ def _force_eevee(scene):
         return False
 
 
-def _depth_range(scene, cam):
-    """Near and far along the camera's view direction, from the set's own bounding box, so the
-    depth map uses its whole range. Without this the sky sits at 10^10 and everything real
-    collapses into the first fraction of the gradient - which is what a flat-looking depth map
-    usually is."""
-    from mathutils import Vector
-    # object matrices can be one step behind after a camera move; without this the range is
-    # measured from where the camera used to be and the whole map comes out flat
-    bpy.context.view_layer.update()
-    forward = (cam.matrix_world.to_3x3() @ Vector((0.0, 0.0, -1.0))).normalized()
-    eye = cam.matrix_world.translation
-    dists = []
-    for o in scene.objects:
-        if o.type != "MESH" or not o.data or not len(o.data.polygons):
-            continue
-        for c in o.bound_box:
-            dists.append((o.matrix_world @ Vector(c) - eye).dot(forward))
-    dists = [d for d in dists if d > 0.0]
-    if not dists:
-        return cam.data.clip_start, min(cam.data.clip_end, 100.0)
-    near = max(cam.data.clip_start, min(dists) * 0.95)
-    far = min(cam.data.clip_end, max(dists) * 1.05)
-    return near, max(near + 0.01, far)
+def _depth_node_group(scene, near_white):
+    """Depth pass -> Normalize -> colour ramp -> out.
 
-
-def _depth_node_group(scene, near, far, near_white):
-    """Depth pass -> clamped to the set's own near/far -> colour ramp -> out.
+    Normalize takes whatever is in frame and stretches it across the full range, so the map
+    reads properly wherever the camera is pointed, with nothing to set by hand. (The one place
+    it struggles is an open set with sky in shot: the sky sits at 10^10 and takes the far end.)
 
     Blender 5's compositor is a node group on the scene; there is no Composite node any more,
-    the group's output is the result. The colour ramp is the shader one, reused here."""
+    the group's output is the result, and the colour ramp is the shader one reused here."""
     name = "BB Depth Map"
     ng = bpy.data.node_groups.get(name)
     if ng is not None:
@@ -1295,13 +1291,8 @@ def _depth_node_group(scene, near, far, near_white):
     rl = ng.nodes.new("CompositorNodeRLayers")
     rl.scene = scene
     rl.location = (-600, 0)
-    rng = ng.nodes.new("ShaderNodeMapRange")       # clamped, so the sky lands on 'far'
-    rng.location = (-380, 0)
-    rng.clamp = True
-    rng.inputs["From Min"].default_value = near
-    rng.inputs["From Max"].default_value = far
-    rng.inputs["To Min"].default_value = 0.0
-    rng.inputs["To Max"].default_value = 1.0
+    norm = ng.nodes.new("CompositorNodeNormalize")
+    norm.location = (-360, 0)
     ramp = ng.nodes.new("ShaderNodeValToRGB")
     ramp.location = (-160, 0)
     a, b = (1.0, 0.0) if near_white else (0.0, 1.0)
@@ -1313,8 +1304,8 @@ def _depth_node_group(scene, near, far, near_white):
     depth = rl.outputs.get("Depth") or rl.outputs.get("Z")
     if depth is None:
         return None
-    ng.links.new(depth, rng.inputs["Value"])
-    ng.links.new(rng.outputs["Result"], ramp.inputs["Factor"])
+    ng.links.new(depth, norm.inputs["Value"])
+    ng.links.new(norm.outputs["Value"], ramp.inputs["Factor"])
     ng.links.new(ramp.outputs["Color"], out.inputs[0])
     return ng
 
@@ -1325,15 +1316,10 @@ def _render_depth(context, cam, path):
     scene = context.scene
     switched = _force_eevee(scene)
     vl = context.view_layer
-    keep_z, keep_mist = vl.use_pass_z, vl.use_pass_mist
+    keep_z = vl.use_pass_z
     vl.use_pass_z = True
-    vl.use_pass_mist = True
-    near, far = _depth_range(scene, cam)
-    if scene.world is not None:
-        scene.world.mist_settings.start = near         # the mist pass, ready for anyone who
-        scene.world.mist_settings.depth = max(0.01, far - near)   # prefers it to raw depth
     prev_group = getattr(scene, "compositing_node_group", None)
-    ng = _depth_node_group(scene, near, far, scene.bb_sv.depth_near_white)
+    ng = _depth_node_group(scene, scene.bb_sv.depth_near_white)
     if ng is None:
         _flash("Could not build the depth map nodes", seconds=4)
         return False
@@ -1369,10 +1355,81 @@ def _render_depth(context, cam, path):
         scene.compositing_node_group = prev_group
         vs.view_transform, vs.look, vs.exposure, vs.gamma = keep_view
         r.filepath, r.image_settings.file_format, r.image_settings.color_mode = keep
-        vl.use_pass_z, vl.use_pass_mist = keep_z, keep_mist
+        vl.use_pass_z = keep_z
         if switched:
             _flash("Render engine set to EEVEE for the depth map", seconds=4)
     return os.path.exists(path)
+
+
+_LOOK_ATTRS = ("type", "light", "color_type", "single_color", "background_type",
+               "background_color", "show_xray", "show_cavity", "cavity_type",
+               "cavity_ridge_factor", "cavity_valley_factor", "curvature_ridge_factor",
+               "curvature_valley_factor", "show_object_outline", "object_outline_color",
+               "show_specular_highlight", "wireframe_color_type")
+
+
+def _lineart_look(shading):
+    """White paper, dark edges: flat single-colour shading with every edge Blender can draw
+    turned up - the creases and corners from cavity, the silhouettes from the object outline.
+    No lights, no materials, no shading gradients: just the drawing."""
+    sh = shading
+    sh.type = "SOLID"
+    if _enum_ok(sh, "color_type", "SINGLE"):
+        sh.color_type = "SINGLE"
+        sh.single_color = (1.0, 1.0, 1.0)
+    if _enum_ok(sh, "light", "FLAT"):
+        sh.light = "FLAT"
+    for attr, value in (("show_specular_highlight", False), ("show_xray", False),
+                        ("show_cavity", True), ("cavity_ridge_factor", 2.5),
+                        ("cavity_valley_factor", 2.5), ("curvature_ridge_factor", 2.0),
+                        ("curvature_valley_factor", 2.0), ("show_object_outline", True)):
+        if hasattr(sh, attr):
+            setattr(sh, attr, value)
+    if _enum_ok(sh, "cavity_type", "BOTH"):
+        sh.cavity_type = "BOTH"
+    if hasattr(sh, "object_outline_color"):
+        sh.object_outline_color = (0.0, 0.0, 0.0)
+    if _enum_ok(sh, "background_type", "VIEWPORT"):
+        sh.background_type = "VIEWPORT"
+        sh.background_color = (1.0, 1.0, 1.0)
+
+
+def _lift_lines(path, strength=1.0):
+    """Turn a flat grey drawing into black lines on white paper.
+
+    Solid view draws the paper at about 0.73 and the lines only a little darker than that, so
+    straight out of the viewport it reads as grey on grey (measured on Happy 4Eva: paper 0.729,
+    the darkest lines 0.46, nothing above 0.733). The paper is taken as the value most of the
+    frame sits at, the darkest half a percent becomes black, and a gamma pushes what is left of
+    the lines down without touching the paper."""
+    try:
+        import numpy as np
+        img = bpy.data.images.load(path, check_existing=False)
+    except Exception:
+        return False
+    try:
+        px = np.empty(len(img.pixels), dtype=np.float32)
+        img.pixels.foreach_get(px)
+        a = px.reshape(-1, 4)
+        lum = a[:, 0] * 0.2126 + a[:, 1] * 0.7152 + a[:, 2] * 0.0722
+        white = float(np.percentile(lum, 97.0))
+        black = float(np.percentile(lum, 0.5))
+        if white - black < 1e-4:
+            return False
+        out = np.clip((lum - black) / (white - black), 0.0, 1.0)
+        if strength > 0.0:
+            out = out ** (1.0 + strength * 0.8)
+        a[:, 0] = a[:, 1] = a[:, 2] = out
+        a[:, 3] = 1.0
+        img.pixels.foreach_set(a.ravel())
+        img.filepath_raw = path
+        img.file_format = "PNG"
+        img.save()
+        return True
+    except Exception:
+        return False
+    finally:
+        bpy.data.images.remove(img)
 
 
 def _capture_pass(context, area, cam, key, path):
@@ -1381,8 +1438,11 @@ def _capture_pass(context, area, cam, key, path):
         return _render_depth(context, cam, path)
     space = area.spaces.active
     sh = space.shading
-    keep = (sh.type, sh.light, sh.color_type, sh.single_color[:],
-            sh.background_type, sh.background_color[:], sh.show_xray)
+    keep = {a: (tuple(getattr(sh, a)) if a in ("single_color", "background_color",
+                                               "object_outline_color") else getattr(sh, a))
+            for a in _LOOK_ATTRS if hasattr(sh, a)}
+    render = context.scene.render
+    keep_res = render.resolution_percentage
     try:
         if key == "solid":
             sh.type = "SOLID"
@@ -1390,22 +1450,25 @@ def _capture_pass(context, area, cam, key, path):
                 sh.color_type = "MATERIAL"
             if _enum_ok(sh, "light", "STUDIO"):
                 sh.light = "STUDIO"
-        elif key == "flat":
-            sh.type = "SOLID"
-            if _enum_ok(sh, "color_type", "SINGLE"):
-                sh.color_type = "SINGLE"
-                sh.single_color = (0.75, 0.75, 0.75)
-            if _enum_ok(sh, "light", "FLAT"):
-                sh.light = "FLAT"
+        elif key == "lineart":
+            _lineart_look(sh)
         elif key == "wire":
             sh.type = "WIREFRAME"
             _wire_look(sh)
+        if key == "lineart":
+            render.resolution_percentage = keep_res * context.scene.bb_sv.lineart_scale
         ok = _grab_view(context, area, path)
     finally:
-        (sh.type, sh.light, sh.color_type, sh.single_color,
-         sh.background_type, sh.background_color, sh.show_xray) = keep
+        render.resolution_percentage = keep_res
+        for attr, value in keep.items():
+            try:
+                setattr(sh, attr, value)
+            except Exception:
+                pass
     if ok and key == "grey":
         _desaturate(path)
+    if ok and key == "lineart":
+        _lift_lines(path, context.scene.bb_sv.lineart_contrast)
     return ok
 
 
@@ -1459,6 +1522,10 @@ def _draw_passes(lay, p):
     grid = box.grid_flow(columns=2, even_columns=True, align=True)
     for key, label, icon in CAPTURE_PASSES:
         grid.prop(p, "pass_" + key, text=label, icon=icon, toggle=True)
+    if p.pass_lineart:
+        row = box.row(align=True)
+        row.prop(p, "lineart_scale")
+        row.prop(p, "lineart_contrast")
     if p.pass_depth:
         box.prop(p, "depth_near_white")
         row = box.row()

@@ -27,7 +27,7 @@
       "id": "bb_set_viewer",
       "name": "BB Set Viewer",
       "tagline": "Game-style walk and one-panel camera for film set previs",
-      "version": "2.10.0",
+      "version": "2.11.0",
       "type": "add-on",
       "maintainer": "Lakao456",
       "license": [
@@ -42,9 +42,9 @@
         "3D View",
         "Camera"
       ],
-      "archive_url": "./bb_set_viewer-2.10.0.zip",
-      "archive_size": 27961,
-      "archive_hash": "sha256:577d67801398f48c4dcdbc55ba260b4525b58dc033041f95425affb1f8524a7b"
+      "archive_url": "./bb_set_viewer-2.11.0.zip",
+      "archive_size": 28744,
+      "archive_hash": "sha256:4ef7fcef4ffd2537fa358d6de00b50cd511c54a6b16178860a34a4b1374262f4"
     }
   ]
 }
