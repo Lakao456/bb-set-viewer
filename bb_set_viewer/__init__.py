@@ -57,7 +57,26 @@ v2.11 (2 Oct 2026): the depth map uses Normalize, so it fits whatever the camera
      out of the viewport it is grey on grey: paper 0.73, darkest lines 0.46, nothing above
      0.73. After the stretch: paper 0.96, lines 0.06.
 v2.12 (2 Oct 2026): the wireframe pass is gone - line art is what it was wanted for, and two
-     similar-sounding passes only cause confusion. Wire is still a look button, as it always was.
+     similar-sounding passes only cause confusion.
+v2.13 (2 Oct 2026, not published - a working build): the panels were rebuilt. Two mode buttons
+     at the top, one Shot panel (walk + speed, the three looks, capture and its passes),
+     Cameras on its own, Lens/Focus/Tilt merged into Camera Settings, and everything you set
+     once moved into a closed Settings panel. The looks are now Fast (solid), Preview (material)
+     and Render (EEVEE with ray tracing, always using the set's own lights); the wire button is
+     gone. Line art went back to the settings that actually produced a drawing - flat single
+     colour and nothing else, with the contrast fixed on the saved image afterwards, never in
+     Blender.
+v2.14 (3 Oct 2026, working build): six looks instead of three, from the viewport settings Aman
+     settled on by hand - Fast, Clay, Line Art, Flat Colour, Preview, Render - with one table
+     driving both the view buttons and the capture passes so they cannot drift. Easy Mode shows
+     the same looks and captures only what is on screen, with its own Depth Map button. Camera
+     Settings keeps roll and Reset Horizon only; depth of field is greyed out rather than
+     hidden. A mini map of the set draws in the corner of the viewport in Artist Mode, with the
+     cameras on it and where you are standing.
+v2.15 (3 Oct 2026): Easy Mode gets two depth buttons under the looks - Generate Separate Depth
+     Map, and Multiply with Depth Map, which captures the view and multiplies it by its own
+     depth so a drawing gains the distance it cannot show on its own. Both are offered only for
+     Clay, Line Art and Flat Colour.
 
   4. Easy Mode - one panel, one camera. The viewport IS the camera: Walk moves
              it, sliders set focal length, focus distance, depth of field and
@@ -91,7 +110,7 @@ from mathutils import Euler, Matrix, Vector
 bl_info = {
     "name": "BB Set Viewer",
     "author": "Beta Builder",
-    "version": (2, 12, 0),
+    "version": (2, 15, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > BB Set",
     "description": "Game-style WASD navigation and panel-driven camera control",
@@ -273,7 +292,6 @@ class BBSV_Props(PropertyGroup):
     show_frame: BoolProperty(name="Framing", default=True)
     show_parts: BoolProperty(name="Show / Hide Set Parts", default=True)
     show_look: BoolProperty(name="Look", default=True)
-    look_before_wire: StringProperty(default="MATERIAL", options={"HIDDEN"})
     scene_lights: BoolProperty(
         name="Set Lights",
         description="Light Preview with the set's own lights and world. Turn it off for "
@@ -311,32 +329,26 @@ class BBSV_Props(PropertyGroup):
         get=_dof_get, set=_dof_set,
     )
     # Capture passes: one press of Capture (or C) saves every pass that is ticked.
-    multi_pass: BoolProperty(
-        name="Capture Passes",
-        description="Save several versions of the same frame at once - the look, a blockout, "
-                    "a depth map and so on. Off saves just what you see",
-        default=False,
+    look_now: StringProperty(default="PREVIEW", options={"HIDDEN"})
+    show_minimap: BoolProperty(
+        name="Mini Map", default=False,
+        description="A plan of the set in the corner of the viewport, with the cameras on it "
+                    "and where you are standing",
+        update=lambda self, ctx: _map_enable(self.show_minimap),
     )
-    pass_look: BoolProperty(name="Look", default=True,
-                            description="The set exactly as you see it now")
-    pass_solid: BoolProperty(name="Blockout", default=False,
-                             description="Solid shading: shapes and staging, no materials")
-    pass_lineart: BoolProperty(name="Line Art", default=False,
-                               description="A line drawing: flat white paper with the edges of "
-                                           "everything drawn in. Saved at a higher resolution")
-    lineart_scale: IntProperty(
-        name="Line Art Detail", default=2, min=1, max=4,
-        description="How many times the normal resolution the line art is drawn at. Higher "
-                    "means finer, denser lines",
-    )
-    lineart_contrast: FloatProperty(
-        name="Line Art Contrast", default=1.0, min=0.0, max=2.0,
-        description="How hard the lines are pushed towards black and the paper towards white",
-    )
+    pass_look: BoolProperty(name="Current View", default=True,
+                            description="Whatever is on screen right now")
+    pass_FAST: BoolProperty(name="Fast", default=False, description="Solid view with the studio light")
+    pass_CLAY: BoolProperty(name="Clay", default=False, description="One clay colour, soft studio light")
+    pass_LINE: BoolProperty(name="Line Art", default=False,
+                            description="A line drawing, saved at a higher resolution")
+    pass_COLOUR: BoolProperty(name="Flat Colour", default=False,
+                              description="Flat material colours with black outlines")
+    pass_PREVIEW: BoolProperty(name="Preview", default=False, description="Material preview")
     pass_grey: BoolProperty(name="Greyscale", default=False,
-                            description="The look with the colour taken out")
+                            description="The current view with the colour taken out")
     pass_depth: BoolProperty(name="Depth Map", default=False,
-                             description="A real depth map. This one renders the frame in EEVEE, "
+                             description="A real depth map. This renders the frame in EEVEE, "
                                          "so it takes a few seconds")
     depth_near_white: BoolProperty(
         name="Near is White", default=True,
@@ -921,7 +933,7 @@ class BBSV_OT_camera_view(Operator):
 
 
 class BBSV_OT_set_look(Operator):
-    """Change how the set is drawn"""
+    """Change how the set is drawn on screen"""
 
     bl_idname = "bb_sv.set_look"
     bl_label = "Set Look"
@@ -935,17 +947,14 @@ class BBSV_OT_set_look(Operator):
             return {"CANCELLED"}
         p = context.scene.bb_sv
         sh = area.spaces.active.shading
-        if self.mode == "WIREFRAME":
-            if sh.type == "WIREFRAME":                       # pressing Wire again goes back
-                self.mode = p.look_before_wire or "MATERIAL"
-            else:
-                p.look_before_wire = sh.type
-                sh.type = "WIREFRAME"
-                _wire_look(sh)
-                return {"FINISHED"}
-        sh.type = self.mode
+        _apply_look(sh, self.mode, context.scene)
         _plain_background(sh)
-        _scene_lighting(sh, p.scene_lights)
+        if self.mode == "RENDER":
+            _force_eevee(context.scene)       # no Cycles in this workflow
+            _scene_lighting(sh, True)         # a render view on the studio light is pointless
+        else:
+            _scene_lighting(sh, p.scene_lights)
+        p.look_now = self.mode
         return {"FINISHED"}
 
 
@@ -955,19 +964,6 @@ def _enum_ok(owner, prop, value):
         return value in {i.identifier for i in owner.bl_rna.properties[prop].enum_items}
     except Exception:
         return False
-
-
-def _wire_look(shading):
-    """A wireframe you can actually read: one colour per object, dark background, no X-ray.
-    Blender's default is near-black wires on mid-grey, which shows almost nothing."""
-    if _enum_ok(shading, "wireframe_color_type", "RANDOM"):
-        shading.wireframe_color_type = "RANDOM"
-    for attr in ("show_xray", "show_xray_wireframe"):        # see-through is a separate thing
-        if hasattr(shading, attr):
-            setattr(shading, attr, False)
-    if _enum_ok(shading, "background_type", "VIEWPORT"):
-        shading.background_type = "VIEWPORT"
-        shading.background_color = (0.045, 0.045, 0.055)
 
 
 def _plain_background(shading):
@@ -1210,18 +1206,103 @@ def _grab_view(context, area, path):
     return True
 
 
+# The looks. One table drives both the view buttons and the capture passes, so what you see
+# on screen and what lands in the Captures folder can never drift apart. Each is a recipe for
+# Blender's own viewport shading - nothing here is a render except RENDER itself.
+VIEW_LOOKS = (
+    ("FAST", "Fast", "Solid view with the studio light - shapes and staging, nothing to wait for"),
+    ("CLAY", "Clay", "Solid view, one clay colour under a soft studio light - form without "
+                     "materials or lighting getting in the way"),
+    ("LINE", "Line Art", "A line drawing: flat white, black outlines, creases picked out by "
+                         "cavity. This is the pass the generation artists use most"),
+    ("COLOUR", "Flat Colour", "Flat material colours with black outlines and no shading at all"),
+    ("PREVIEW", "Preview", "Material preview: the set with its own materials"),
+    ("RENDER", "Render", "EEVEE with ray tracing, the set's own lights and world"),
+)
+LOOK_LABEL = {k: l for k, l, _t in VIEW_LOOKS}
+
+
+def _apply_look(shading, key, scene=None):
+    """Put the viewport into one of the looks above. Values come from what Aman settled on by
+    hand (2 Oct): the cavity numbers in particular are modest on purpose - turning them up
+    stops the line art being a drawing and turns it into soft grey shading."""
+    sh = shading
+    if key == "PREVIEW":
+        sh.type = "MATERIAL"
+        return
+    if key == "RENDER":
+        sh.type = "RENDERED"
+        return
+
+    sh.type = "SOLID"
+    for attr, value in (("show_specular_highlight", True), ("show_xray", False),
+                        ("show_cavity", False), ("show_object_outline", False)):
+        if hasattr(sh, attr):
+            setattr(sh, attr, value)
+
+    if key == "FAST":
+        if _enum_ok(sh, "light", "STUDIO"):
+            sh.light = "STUDIO"
+        if _enum_ok(sh, "color_type", "MATERIAL"):
+            sh.color_type = "MATERIAL"
+        return
+
+    if key == "CLAY":
+        if _enum_ok(sh, "light", "STUDIO"):
+            sh.light = "STUDIO"
+        for name in ("paint.sl", "basic.sl", "Default"):
+            try:
+                sh.studio_light = name
+                break
+            except (TypeError, AttributeError):
+                continue
+        if _enum_ok(sh, "color_type", "SINGLE"):
+            sh.color_type = "SINGLE"
+            sh.single_color = (0.80, 0.80, 0.80)
+        return
+
+    # the two flat looks share everything except where the colour comes from
+    if _enum_ok(sh, "light", "FLAT"):
+        sh.light = "FLAT"
+    if hasattr(sh, "show_specular_highlight"):
+        sh.show_specular_highlight = False
+    if hasattr(sh, "show_object_outline"):
+        sh.show_object_outline = True
+    if hasattr(sh, "object_outline_color"):
+        sh.object_outline_color = (0.0, 0.0, 0.0)
+
+    if key == "LINE":
+        if _enum_ok(sh, "color_type", "OBJECT"):
+            sh.color_type = "OBJECT"       # object colour is white unless someone set it
+        if hasattr(sh, "show_cavity"):
+            sh.show_cavity = True
+        if _enum_ok(sh, "cavity_type", "BOTH"):
+            sh.cavity_type = "BOTH"
+        for attr, value in (("cavity_ridge_factor", 1.0), ("cavity_valley_factor", 1.0),
+                            ("curvature_ridge_factor", 1.0), ("curvature_valley_factor", 2.0)):
+            if hasattr(sh, attr):
+                setattr(sh, attr, value)
+    elif key == "COLOUR":
+        if _enum_ok(sh, "color_type", "MATERIAL"):
+            sh.color_type = "MATERIAL"
+
+
+LINEART_SCALE = 2          # drawn at twice the frame size: finer, denser lines
+LINEART_CONTRAST = 1.0     # how hard the saved image is pushed to ink on paper
+
 CAPTURE_PASSES = (
-    ("look", "Look", "LIGHT"),
-    ("solid", "Blockout", "SHADING_SOLID"),
-    ("lineart", "Line Art", "MOD_LINEART"),
+    ("look", "Current View", "RESTRICT_VIEW_OFF"),
+    ("FAST", "Fast", "SHADING_SOLID"),
+    ("CLAY", "Clay", "MATSPHERE"),
+    ("LINE", "Line Art", "MOD_LINEART"),
+    ("COLOUR", "Flat Colour", "COLOR"),
+    ("PREVIEW", "Preview", "SHADING_TEXTURE"),
     ("grey", "Greyscale", "IMAGE_ZDEPTH"),
     ("depth", "Depth Map", "MOD_FLUIDSIM"),
 )
 
 
 def _enabled_passes(props):
-    if not props.multi_pass:
-        return ["look"]
     on = [k for k, _l, _i in CAPTURE_PASSES if getattr(props, "pass_" + k, False)]
     return on or ["look"]
 
@@ -1367,32 +1448,6 @@ _LOOK_ATTRS = ("type", "light", "color_type", "single_color", "background_type",
                "show_specular_highlight", "wireframe_color_type")
 
 
-def _lineart_look(shading):
-    """White paper, dark edges: flat single-colour shading with every edge Blender can draw
-    turned up - the creases and corners from cavity, the silhouettes from the object outline.
-    No lights, no materials, no shading gradients: just the drawing."""
-    sh = shading
-    sh.type = "SOLID"
-    if _enum_ok(sh, "color_type", "SINGLE"):
-        sh.color_type = "SINGLE"
-        sh.single_color = (1.0, 1.0, 1.0)
-    if _enum_ok(sh, "light", "FLAT"):
-        sh.light = "FLAT"
-    for attr, value in (("show_specular_highlight", False), ("show_xray", False),
-                        ("show_cavity", True), ("cavity_ridge_factor", 2.5),
-                        ("cavity_valley_factor", 2.5), ("curvature_ridge_factor", 2.0),
-                        ("curvature_valley_factor", 2.0), ("show_object_outline", True)):
-        if hasattr(sh, attr):
-            setattr(sh, attr, value)
-    if _enum_ok(sh, "cavity_type", "BOTH"):
-        sh.cavity_type = "BOTH"
-    if hasattr(sh, "object_outline_color"):
-        sh.object_outline_color = (0.0, 0.0, 0.0)
-    if _enum_ok(sh, "background_type", "VIEWPORT"):
-        sh.background_type = "VIEWPORT"
-        sh.background_color = (1.0, 1.0, 1.0)
-
-
 def _lift_lines(path, strength=1.0):
     """Turn a flat grey drawing into black lines on white paper.
 
@@ -1443,16 +1498,13 @@ def _capture_pass(context, area, cam, key, path):
     render = context.scene.render
     keep_res = render.resolution_percentage
     try:
-        if key == "solid":
-            sh.type = "SOLID"
-            if _enum_ok(sh, "color_type", "MATERIAL"):
-                sh.color_type = "MATERIAL"
-            if _enum_ok(sh, "light", "STUDIO"):
-                sh.light = "STUDIO"
-        elif key == "lineart":
-            _lineart_look(sh)
-        if key == "lineart":
-            render.resolution_percentage = keep_res * context.scene.bb_sv.lineart_scale
+        if key in LOOK_LABEL:                      # a named look: set the viewport to it
+            _apply_look(sh, key, context.scene)
+            if key == "RENDER":
+                _force_eevee(context.scene)
+                _scene_lighting(sh, True)
+        if key == "LINE":
+            render.resolution_percentage = keep_res * LINEART_SCALE
         ok = _grab_view(context, area, path)
     finally:
         render.resolution_percentage = keep_res
@@ -1463,14 +1515,15 @@ def _capture_pass(context, area, cam, key, path):
                 pass
     if ok and key == "grey":
         _desaturate(path)
-    if ok and key == "lineart":
-        _lift_lines(path, context.scene.bb_sv.lineart_contrast)
+    if ok and key == "LINE":
+        _lift_lines(path, LINEART_CONTRAST)
     return ok
 
 
-def _capture_all(context, area, cam, base_path):
-    """Save every ticked pass of this frame. Returns the names written."""
-    keys = _enabled_passes(context.scene.bb_sv)
+def _capture_all(context, area, cam, base_path, keys=None):
+    """Save the passes asked for - by default every one ticked in Artist Mode. Easy Mode passes
+    an explicit list, because there it saves only what is on screen."""
+    keys = keys if keys is not None else _enabled_passes(context.scene.bb_sv)
     written = []
     for key in keys:
         path = _pass_path(base_path, key)
@@ -1509,24 +1562,34 @@ class BBSV_OT_clear_cameras(Operator):
         return {"FINISHED"}
 
 
+def _draw_looks(lay, p, columns=3):
+    """The view buttons: what the artist actually sees on screen."""
+    grid = lay.grid_flow(row_major=True, columns=columns, even_columns=True, align=True)
+    grid.scale_y = 1.2
+    for key, label, _tip in VIEW_LOOKS:
+        grid.operator("bb_sv.set_look", text=label, depress=p.look_now == key).mode = key
+    # Set Lights only means anything in Preview; Render always uses the set's own lighting
+    if p.look_now == "PREVIEW":
+        lay.prop(p, "scene_lights", toggle=True, icon="LIGHT")
+    elif p.look_now == "RENDER":
+        row = lay.row()
+        row.enabled = False
+        row.prop(p, "scene_lights", toggle=True, icon="LIGHT",
+                 text="Set Lights (always on here)")
+
+
 def _draw_passes(lay, p):
-    """The pass picker: off, it saves what you see; on, it saves every ticked version."""
-    box = lay.box()
-    box.prop(p, "multi_pass", text="Capture Passes", icon="RENDERLAYERS")
-    if not p.multi_pass:
-        return
-    grid = box.grid_flow(columns=2, even_columns=True, align=True)
+    """Which versions of the frame one press of Capture saves. Always on show: hiding this
+    behind a toggle only made people wonder where it went."""
+    col = lay.column(align=True)
+    row = col.row()
+    row.scale_y = 0.8
+    row.label(text="Capture passes", icon="RENDERLAYERS")
+    grid = col.grid_flow(row_major=True, columns=2, even_columns=True, align=True)
     for key, label, icon in CAPTURE_PASSES:
         grid.prop(p, "pass_" + key, text=label, icon=icon, toggle=True)
-    if p.pass_lineart:
-        row = box.row(align=True)
-        row.prop(p, "lineart_scale")
-        row.prop(p, "lineart_contrast")
     if p.pass_depth:
-        box.prop(p, "depth_near_white")
-        row = box.row()
-        row.scale_y = 0.6
-        row.label(text="The depth map renders the frame in EEVEE - a few seconds", icon="INFO")
+        col.prop(p, "depth_near_white")
 
 
 class BBSV_OT_capture(Operator):
@@ -2306,7 +2369,7 @@ class BBSV_OT_easy_capture(Operator):
         stamp = time.strftime("%Y-%m-%d %H%M%S")
         base = "Shot %02d - %dmm - %s" % (n, round(cam.data.lens), stamp)
         path = os.path.join(_capture_dir(), base + ".png")
-        written = _capture_all(context, area, cam, path)
+        written = _capture_all(context, area, cam, path, keys=["look"])   # what you see
         if not written:
             return {"CANCELLED"}
         d = cam.data
@@ -2330,12 +2393,121 @@ class BBSV_OT_easy_capture(Operator):
         return {"FINISHED"}
 
 
+DEPTH_LOOKS = {"CLAY", "LINE", "COLOUR"}      # the drawing looks depth is useful against
+
+
+def _multiply_with_depth(art_path, depth_path, out_path):
+    """Shade a drawing with its own depth map: every pixel times the depth value there.
+
+    With the depth map set to near-white (the default), near surfaces keep their brightness and
+    far ones fall away - the drawing gains the distance it cannot show on its own."""
+    try:
+        import numpy as np
+        art = bpy.data.images.load(art_path, check_existing=False)
+    except Exception:
+        return False
+    depth = None
+    try:
+        depth = bpy.data.images.load(depth_path, check_existing=False)
+        if tuple(art.size) != tuple(depth.size):
+            return False
+        a = np.empty(len(art.pixels), dtype=np.float32)
+        art.pixels.foreach_get(a)
+        d = np.empty(len(depth.pixels), dtype=np.float32)
+        depth.pixels.foreach_get(d)
+        a = a.reshape(-1, 4)
+        d = d.reshape(-1, 4)
+        shade = d[:, 0] * 0.2126 + d[:, 1] * 0.7152 + d[:, 2] * 0.0722
+        a[:, 0] *= shade
+        a[:, 1] *= shade
+        a[:, 2] *= shade
+        a[:, 3] = 1.0
+        out = bpy.data.images.new("bb_multiplied", art.size[0], art.size[1])
+        try:
+            out.pixels.foreach_set(a.ravel())
+            out.filepath_raw = out_path
+            out.file_format = "PNG"
+            out.save()
+        finally:
+            bpy.data.images.remove(out)
+        return True
+    except Exception:
+        return False
+    finally:
+        bpy.data.images.remove(art)
+        if depth is not None:
+            bpy.data.images.remove(depth)
+
+
+class BBSV_OT_easy_depth(Operator):
+    """Render a depth map of this shot. It cannot be shown on screen, so it is its own button"""
+
+    bl_idname = "bb_sv.easy_depth"
+    bl_label = "Depth Map"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        cam = _active_cam(context)
+        area = _view3d_area(context)
+        if cam is None or area is None:
+            return {"CANCELLED"}
+        base = _capture_path(cam, "QUICK")
+        path = _pass_path(base, "depth")
+        _flash("Rendering the depth map...", seconds=3)
+        if not _render_depth(context, cam, path):
+            return {"CANCELLED"}
+        _flash("Depth map saved: %s" % os.path.basename(path), seconds=5)
+        self.report({"INFO"}, path)
+        return {"FINISHED"}
+
+
+class BBSV_OT_easy_depth_multiply(Operator):
+    """Capture this view and multiply it with its own depth map, into one picture"""
+
+    bl_idname = "bb_sv.easy_depth_multiply"
+    bl_label = "Multiply with Depth Map"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        cam = _active_cam(context)
+        area = _view3d_area(context)
+        if cam is None or area is None:
+            return {"CANCELLED"}
+        if bpy.app.is_job_running("SHADER_COMPILATION"):
+            _flash("Materials are still loading - try again in a few seconds", seconds=4)
+            return {"CANCELLED"}
+        look = context.scene.bb_sv.look_now
+        base = _capture_path(cam, "QUICK")
+        art = _pass_path(base, "view")
+        depth = _pass_path(base, "depth")
+        out = _pass_path(base, "depth multiplied")
+
+        _flash("Capturing and rendering the depth map...", seconds=3)
+        if not _grab_view(context, area, art):
+            return {"CANCELLED"}
+        if look == "LINE":
+            _lift_lines(art, LINEART_CONTRAST)      # the drawing has to be ink on paper first
+        made = _render_depth(context, cam, depth) and _multiply_with_depth(art, depth, out)
+        for tmp in (art, depth):        # the separate button is there for anyone who wants these
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        if not made:
+            _flash("Could not make the depth-multiplied picture", seconds=4)
+            return {"CANCELLED"}
+        _flash("Saved: %s" % os.path.basename(out), seconds=5)
+        self.report({"INFO"}, out)
+        return {"FINISHED"}
+
+
 class BBSV_PT_easy(Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "BB Set"
     bl_label = "Shot"
     bl_idname = "BBSV_PT_easy"
+    bl_order = 1
 
     @classmethod
     def poll(cls, context):
@@ -2346,25 +2518,23 @@ class BBSV_PT_easy(Panel):
         p = context.scene.bb_sv
         d = _active_cam(context).data
 
-        col = lay.column()
-        col.scale_y = 2.0
-        col.operator("bb_sv.flythrough", text="Walk  (F)", icon="VIEW_PAN")
-
-        area = _view3d_area(context)
-        current = area.spaces.active.shading.type if area else ""
         row = lay.row(align=True)
-        row.scale_y = 1.3
-        for label, mode in (("Fast", "SOLID"), ("Preview", "MATERIAL"), ("Wire", "WIREFRAME")):
-            row.operator("bb_sv.set_look", text=label, depress=current == mode).mode = mode
-        sub = lay.row()
-        sub.scale_y = 1.3
-        sub.enabled = current in {"MATERIAL", "RENDERED"}       # the flags only bite in Preview
-        sub.prop(p, "scene_lights", toggle=True, icon="LIGHT")
+        row.scale_y = 1.8
+        row.operator("bb_sv.flythrough", text="Walk  (F)", icon="VIEW_PAN")
+        sub = row.row(align=True)
+        sub.scale_x = 0.55
+        sub.prop(p, "speed", text="")
+
+        lay.separator()
+        _draw_looks(lay, p, columns=2)      # in Easy Mode the looks ARE the choice
+        col = lay.column(align=True)
+        col.enabled = p.look_now in DEPTH_LOOKS
+        col.operator("bb_sv.easy_depth", text="Generate Separate Depth Map", icon="MOD_FLUIDSIM")
+        col.operator("bb_sv.easy_depth_multiply", text="Multiply with Depth Map",
+                     icon="IMAGE_ZDEPTH")
         lay.separator()
 
         lay.prop(p, "lens_slider", slider=True)
-        lay.separator()
-
         lay.prop(p, "dof_toggle")
         col = lay.column(align=True)
         col.enabled = d.dof.use_dof
@@ -2372,11 +2542,11 @@ class BBSV_PT_easy(Panel):
         col.prop(p, "fstop_slider", slider=True)
         lay.separator()
 
-        _draw_passes(lay, p)
-        col = lay.column()
+        col = lay.column(align=True)
         col.scale_y = 2.0
         col.operator("bb_sv.easy_capture", text="Capture  (C)", icon="RENDER_STILL")
-        lay.operator("bb_sv.open_captures", text="Open Captures Folder", icon="FILE_FOLDER", emboss=False)
+        lay.operator("bb_sv.open_captures", text="Open Captures Folder", icon="FILE_FOLDER",
+                     emboss=False)
 
 
 class BBSV_PT_easy_more(Panel):
@@ -2386,6 +2556,7 @@ class BBSV_PT_easy_more(Panel):
     bl_category = "BB Set"
     bl_label = "More"
     bl_idname = "BBSV_PT_easy_more"
+    bl_order = 7
     bl_parent_id = "BBSV_PT_easy"
     bl_options = {"DEFAULT_CLOSED"}
 
@@ -2412,71 +2583,253 @@ class _BBPanel:
         return not cls.flag or getattr(context.scene.bb_sv, cls.flag)
 
 
-class BBSV_PT_capture(_BBPanel, Panel):
-    bl_label = "Capture"
-    bl_idname = "BBSV_PT_capture"
-    flag = "show_capture"
+# ---------------------------------------------------------------------------
+# The mini map: a plan of the set in the corner of the viewport, with the cameras on it.
+#
+# Drawn straight to the viewport rather than built as an image in a panel, because that way it
+# is live - the cameras and your own position move as you walk, with no refresh button. The
+# plan itself is every object's footprint (its bounding box flattened to the floor), worked out
+# once and cached: no render, no image file.
+# ---------------------------------------------------------------------------
+
+_MAP = {"key": None, "lines": None, "bounds": None, "handle": None}
+MAP_SIZE = 220          # pixels at 1x; scaled by the interface scale below
+MAP_PAD = 16
+MAP_MIN_SIZE = 1.2      # metres: smaller things are clutter on a plan
+MAP_MAX_SHAPES = 120    # the biggest footprints only, so the plan stays readable
+
+
+def _map_plan(scene):
+    """The set as a floor plan: the outline of every object big enough to be a wall, a counter
+    or a piece of furniture. Cached until the set changes.
+
+    Only the big things, and outlines rather than filled boxes - a set like Happy 4Eva has
+    nearly 8,000 objects, and drawing all of them solid gives one grey blob that tells you
+    nothing about where you are."""
+    import numpy as np
+    objs = [o for o in scene.objects
+            if o.type == "MESH" and o.data is not None and len(o.data.polygons)]
+    key = (scene.name, len(objs))
+    if _MAP["key"] == key and _MAP["lines"] is not None:
+        return _MAP["lines"], _MAP["bounds"]
+
+    boxes, full = [], []
+    for o in objs:
+        m = np.array(o.matrix_world.to_4x4())
+        pts = np.array([list(c) for c in o.bound_box])
+        w = pts @ m[:3, :3].T + m[:3, 3]
+        box = (w[:, 0].min(), w[:, 1].min(), w[:, 0].max(), w[:, 1].max())
+        full.append(box)
+        if (box[2] - box[0]) >= MAP_MIN_SIZE or (box[3] - box[1]) >= MAP_MIN_SIZE:
+            boxes.append(box)
+    if not full:
+        _MAP.update(key=key, lines=None, bounds=None)
+        return None, None
+    if not boxes:
+        boxes = full                      # a small set: draw everything rather than nothing
+    b = np.array(boxes, dtype=np.float32)
+    if len(b) > MAP_MAX_SHAPES:
+        # Keep the biggest footprints: walls, counters, the furniture you navigate by. A room
+        # full of identical chairs drawn in full is a hatch pattern, not a plan.
+        w = b[:, 2] - b[:, 0]
+        h = b[:, 3] - b[:, 1]
+        # Rank by the SMALLER side, not by area: a curtain strip is long and paper-thin and
+        # wins on area, then a hundred of them draw as a hatch pattern over the whole plan.
+        b = b[np.argsort(-np.minimum(w, h))[:MAP_MAX_SHAPES]]
+    x0, y0, x1, y1 = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
+    segs = np.empty((len(b) * 8, 2), dtype=np.float32)        # four edges, two points each
+    corners = ((x0, y0, x1, y0), (x1, y0, x1, y1), (x1, y1, x0, y1), (x0, y1, x0, y0))
+    for i, (ax, ay, bx, by) in enumerate(corners):
+        segs[i * 2::8, 0], segs[i * 2::8, 1] = ax, ay
+        segs[i * 2 + 1::8, 0], segs[i * 2 + 1::8, 1] = bx, by
+    # Framed on the objects actually drawn. Using every object instead lets one stray prop
+    # parked far from the set shrink the plan into a corner of the panel.
+    bounds = (float(x0.min()), float(y0.min()), float(x1.max()), float(y1.max()))
+    _MAP.update(key=key, lines=segs, bounds=bounds)
+    return segs, bounds
+
+
+def _map_draw():
+    """POST_PIXEL: the plan, the cameras, and where you are standing."""
+    try:
+        context = bpy.context
+        if not _ARTIST.get("on") or _ARTIST.get("easy"):
+            return
+        scene = context.scene
+        if not getattr(scene, "bb_sv", None) or not scene.bb_sv.show_minimap:
+            return
+        region = context.region
+        if region is None or region.type != "WINDOW":
+            return
+        lines, bounds = _map_plan(scene)
+        if lines is None:
+            return
+
+        import gpu
+        import numpy as np
+        from gpu_extras.batch import batch_for_shader
+
+        # POST_PIXEL coordinates are real device pixels, so on a Retina screen a raw 220 draws
+        # at half the size it should. Everything here is multiplied by the interface scale.
+        ui = getattr(context.preferences.system, "ui_scale", 1.0) or 1.0
+        size, pad = MAP_SIZE * ui, MAP_PAD * ui
+        minx, miny, maxx, maxy = bounds
+        span = max(maxx - minx, maxy - miny) or 1.0
+        scale = size / span
+        ox = pad + (size - (maxx - minx) * scale) * 0.5
+        oy = pad + (size - (maxy - miny) * scale) * 0.5
+
+        def to_px(xy, clamp=False):
+            out = np.empty_like(xy, dtype=np.float32)
+            out[:, 0] = (xy[:, 0] - minx) * scale + ox
+            out[:, 1] = (xy[:, 1] - miny) * scale + oy
+            if clamp:          # a camera outside the plan is pinned to the edge, not lost
+                out[:, 0] = np.clip(out[:, 0], pad + 4 * ui, pad + size - 4 * ui)
+                out[:, 1] = np.clip(out[:, 1], pad + 4 * ui, pad + size - 4 * ui)
+            return out
+
+        shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+        gpu.state.blend_set("ALPHA")
+
+        m = 6 * ui
+        x0b, y0b, x1b, y1b = pad - m, pad - m, pad + size + m, pad + size + m
+        frame = np.array([(x0b, y0b), (x1b, y0b), (x1b, y1b),
+                          (x0b, y0b), (x1b, y1b), (x0b, y1b)], dtype=np.float32)
+        shader.bind()
+        shader.uniform_float("color", (0.04, 0.04, 0.05, 0.72))
+        batch_for_shader(shader, "TRIS", {"pos": frame}).draw(shader)
+
+        gpu.state.line_width_set(max(1.0, ui))
+        shader.uniform_float("color", (0.72, 0.76, 0.82, 0.6))
+        batch_for_shader(shader, "LINES", {"pos": to_px(lines)}).draw(shader)
+
+        # where you are looking from
+        rv3d = context.region_data
+        if rv3d is not None:
+            eye = rv3d.view_matrix.inverted().translation
+            fwd = (rv3d.view_rotation @ Vector((0.0, 0.0, -1.0))).normalized()
+            me = to_px(np.array([[eye.x, eye.y]], dtype=np.float32), clamp=True)[0]
+            tip = me + np.array([fwd.x, fwd.y], dtype=np.float32) * 18.0 * ui
+            shader.uniform_float("color", (1.0, 0.85, 0.2, 0.95))
+            batch_for_shader(shader, "LINES", {"pos": [tuple(me), tuple(tip)]}).draw(shader)
+            batch_for_shader(shader, "TRIS", {"pos": _map_dot(me, 3.8 * ui)}).draw(shader)
+
+        for cam in _viewer_cams(scene):
+            at = cam.matrix_world.translation
+            look = (cam.matrix_world.to_3x3() @ Vector((0.0, 0.0, -1.0))).normalized()
+            c = to_px(np.array([[at.x, at.y]], dtype=np.float32), clamp=True)[0]
+            tip = c + np.array([look.x, look.y], dtype=np.float32) * 15.0 * ui
+            active = scene.camera is cam
+            shader.uniform_float("color", (0.25, 0.8, 1.0, 1.0) if active else (0.8, 0.8, 0.85, 0.8))
+            batch_for_shader(shader, "LINES", {"pos": [tuple(c), tuple(tip)]}).draw(shader)
+            batch_for_shader(shader, "TRIS", {"pos": _map_dot(c, (4.6 if active else 3.2) * ui)}).draw(shader)
+
+        gpu.state.line_width_set(1.0)
+        gpu.state.blend_set("NONE")
+    except Exception:
+        pass            # a HUD must never take the viewport down with it
+
+
+def _map_dot(centre, r):
+    import math
+    import numpy as np
+    pts = []
+    for i in range(8):
+        a0 = i * math.pi / 4.0
+        a1 = (i + 1) * math.pi / 4.0
+        pts += [tuple(centre),
+                (centre[0] + math.cos(a0) * r, centre[1] + math.sin(a0) * r),
+                (centre[0] + math.cos(a1) * r, centre[1] + math.sin(a1) * r)]
+    return np.array(pts, dtype=np.float32)
+
+
+def _map_enable(on):
+    if on and _MAP["handle"] is None:
+        _MAP["handle"] = bpy.types.SpaceView3D.draw_handler_add(
+            _map_draw, (), "WINDOW", "POST_PIXEL")
+    elif not on and _MAP["handle"] is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(_MAP["handle"], "WINDOW")
+        _MAP["handle"] = None
+
+
+class BBSV_OT_refresh_map(Operator):
+    """Rebuild the mini map after the set has changed"""
+
+    bl_idname = "bb_sv.refresh_map"
+    bl_label = "Refresh Map"
+
+    def execute(self, context):
+        _MAP["key"] = None
+        for a in context.screen.areas:
+            a.tag_redraw()
+        return {"FINISHED"}
+
+
+class BBSV_PT_mode(Panel):
+    """Always first, always open: which mode you are in and how to leave it."""
+
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "BB Set"
+    bl_label = "BB Set"
+    bl_idname = "BBSV_PT_mode"
+    bl_order = 0
 
     def draw(self, context):
-        lay = self.layout
-        cam = _active_cam(context)
-        col = lay.column(align=True)
-        col.enabled = cam is not None
-        row = col.row(align=True)
-        row.scale_y = 1.8
-        row.operator("bb_sv.capture", text="Quick Capture  (C)", icon="IMAGE_DATA").kind = "QUICK"
-        row.operator("bb_sv.capture", text="Render Still", icon="RENDER_STILL").kind = "RENDER"
-        _draw_passes(lay, context.scene.bb_sv)
-        if cam is None:
-            lay.label(text="Add a camera to capture its shot", icon="INFO")
+        col = self.layout.column(align=True)
+        col.scale_y = 1.5
+        if not artist_on():
+            col.operator("bb_sv.artist_enter", text="Enter Artist Mode",
+                         icon="FULLSCREEN_ENTER").easy = False
+            col.operator("bb_sv.artist_enter", text="Enter Easy Mode",
+                         icon="VIEW_CAMERA").easy = True
+        elif _ARTIST.get("easy"):
+            col.operator("bb_sv.switch_mode", text="Enter Artist Mode",
+                         icon="FULLSCREEN_ENTER").easy = False
+            col.operator("bb_sv.artist_exit", text="Exit to Blender", icon="LOOP_BACK")
         else:
-            lay.label(text="Shot from: %s" % cam.name, icon="OUTLINER_OB_CAMERA")
-        lay.operator("bb_sv.open_captures", icon="FILE_FOLDER")
+            col.operator("bb_sv.switch_mode", text="Enter Easy Mode",
+                         icon="VIEW_CAMERA").easy = True
+            col.operator("bb_sv.artist_exit", text="Exit to Blender", icon="LOOP_BACK")
 
 
-class BBSV_PT_navigate(_BBPanel, Panel):
-    bl_label = "Walk"
-    bl_idname = "BBSV_PT_navigate"
-    flag = "show_walk"
+class BBSV_PT_shot(_BBPanel, Panel):
+    """Everything you touch while working a shot: move, look, capture."""
+
+    bl_label = "Shot"
+    bl_idname = "BBSV_PT_shot"
+    bl_order = 2
 
     def draw(self, context):
         lay = self.layout
         p = context.scene.bb_sv
-
-        col = lay.column()
-        col.scale_y = 1.8
-        col.operator("bb_sv.flythrough", icon="VIEW_PAN")
-
-        box = lay.box()
-        for line in (
-            "F - start / stop walking",
-            "Mouse - look around",
-            "W A S D - move,  Space / Ctrl - up / down",
-            "Shift - sprint,  Wheel - speed",
-            "Enter - stop and lock the camera",
-            "Esc - stop,  Right-click - undo the walk",
-        ):
-            row = box.row()
-            row.scale_y = 0.7
-            row.label(text=line)
-
         row = lay.row(align=True)
-        row.prop(p, "fly_target", expand=True)
+        row.scale_y = 1.6
+        row.operator("bb_sv.flythrough", text="Walk  (F)", icon="VIEW_PAN")
+        sub = row.row(align=True)
+        sub.scale_x = 0.55
+        sub.prop(p, "speed", text="")
 
-        col = lay.column(align=True)
-        col.prop(p, "speed")
-        col.prop(p, "sprint")
-        col.prop(p, "sensitivity")
-        col.prop(p, "invert_y")
+        lay.separator()
+        _draw_looks(lay, p)
 
+        lay.separator()
+        cam = _active_cam(context)
         col = lay.column(align=True)
-        col.operator("bb_sv.stand_on_floor", icon="TRIA_DOWN_BAR")
-        col.prop(p, "eye_height")
+        col.enabled = cam is not None
+        col.scale_y = 1.6
+        col.operator("bb_sv.capture", text="Capture  (C)", icon="RENDER_STILL").kind = "QUICK"
+        _draw_passes(lay, p)
+        if cam is None:
+            lay.label(text="Add a camera to capture its shot", icon="INFO")
+        lay.operator("bb_sv.open_captures", text="Open Captures Folder", icon="FILE_FOLDER",
+                     emboss=False)
 
 
 class BBSV_PT_cameras(_BBPanel, Panel):
     bl_label = "Cameras"
     bl_idname = "BBSV_PT_cameras"
+    bl_order = 3
     flag = "show_cameras"
 
     def draw(self, context):
@@ -2487,8 +2840,6 @@ class BBSV_PT_cameras(_BBPanel, Panel):
 
         if not cams:
             lay.label(text="No cameras yet - walk to a view, then add one", icon="INFO")
-            if any(o.type == "CAMERA" for o in scene.objects):
-                lay.operator("bb_sv.clear_cameras", text="Clear All Cameras", icon="TRASH")
         else:
             col = lay.box().column(align=True)
             for cam in cams:
@@ -2496,7 +2847,8 @@ class BBSV_PT_cameras(_BBPanel, Panel):
                 locked = _is_locked(cam)
                 row = col.row(align=True)
                 op = row.operator("bb_sv.look_through", text=cam.name,
-                                  icon="OUTLINER_OB_CAMERA" if active else "CAMERA_DATA", depress=active)
+                                  icon="OUTLINER_OB_CAMERA" if active else "CAMERA_DATA",
+                                  depress=active)
                 op.name = cam.name
                 row.operator("bb_sv.lock_camera", text="", icon="LOCKED" if locked else "UNLOCKED",
                              depress=locked).name = cam.name
@@ -2516,6 +2868,11 @@ class BBSV_PT_cameras(_BBPanel, Panel):
             lay.operator("bb_sv.camera_view", depress=bool(through),
                          text="Looking Through Camera (0)" if through else "Look Through Camera (0)",
                          icon="VIEW_CAMERA")
+        lay.separator()
+        row = lay.row(align=True)
+        row.prop(p, "show_minimap", toggle=True, icon="VIEW_ORTHO")
+        if p.show_minimap:
+            row.operator("bb_sv.refresh_map", text="", icon="FILE_REFRESH")
         if any(o.type == "CAMERA" for o in scene.objects):
             lay.separator()
             lay.operator("bb_sv.clear_cameras", text="Clear All Cameras", icon="TRASH")
@@ -2532,45 +2889,12 @@ def _locked_banner(layout, cam):
     return col
 
 
-class BBSV_PT_adjust(_BBPanel, Panel):
-    bl_label = "Move Camera"
-    bl_idname = "BBSV_PT_adjust"
-    flag = "show_adjust"
+class BBSV_PT_camera_settings(_BBPanel, Panel):
+    """Lens, focus and the small camera moves, in one place."""
 
-    @classmethod
-    def poll(cls, context):
-        return super().poll(context) and _active_cam(context) is not None
-
-    def draw(self, context):
-        lay = _locked_banner(self.layout, _active_cam(context))
-        p = context.scene.bb_sv
-        col = lay.column(align=True)
-        col.prop(p, "nudge")
-        grid = col.grid_flow(row_major=True, columns=2, align=True)
-        for label, axis, amt, icon in (
-            ("Left", "X", -1.0, "TRIA_LEFT"), ("Right", "X", 1.0, "TRIA_RIGHT"),
-            ("Down", "Y", -1.0, "TRIA_DOWN"), ("Up", "Y", 1.0, "TRIA_UP"),
-            ("Back", "Z", 1.0, "SORT_DESC"), ("Forward", "Z", -1.0, "SORT_ASC"),
-        ):
-            op = grid.operator("bb_sv.nudge", text=label, icon=icon)
-            op.axis, op.amount, op.kind = axis, amt, "MOVE"
-
-        col = lay.column(align=True)
-        col.prop(p, "tilt")
-        grid = col.grid_flow(row_major=True, columns=2, align=True)
-        for label, axis, amt in (
-            ("Tilt Up", "X", 1.0), ("Tilt Down", "X", -1.0),
-            ("Pan Left", "Z", 1.0), ("Pan Right", "Z", -1.0),
-            ("Roll Left", "Y", 1.0), ("Roll Right", "Y", -1.0),
-        ):
-            op = grid.operator("bb_sv.nudge", text=label)
-            op.axis, op.amount, op.kind = axis, amt, "TILT"
-        lay.operator("bb_sv.level_horizon", icon="ALIGN_JUSTIFY")
-
-
-class BBSV_PT_lens(_BBPanel, Panel):
-    bl_label = "Lens"
-    bl_idname = "BBSV_PT_lens"
+    bl_label = "Camera Settings"
+    bl_idname = "BBSV_PT_camera_settings"
+    bl_order = 4
     flag = "show_lens"
 
     @classmethod
@@ -2579,73 +2903,46 @@ class BBSV_PT_lens(_BBPanel, Panel):
 
     def draw(self, context):
         lay = _locked_banner(self.layout, _active_cam(context))
+        p = context.scene.bb_sv
         data = _active_cam(context).data
+
         row = lay.row(align=True)
         for mm in LENS_PRESETS:
             row.operator("bb_sv.set_lens", text=str(mm), depress=abs(data.lens - mm) < 0.5).mm = mm
-        row = lay.row()
-        row.scale_y = 0.6
-        row.label(text="Number keys 1-%d pick these, walking or not" % len(LENS_PRESETS))
+        sub = lay.row()
+        sub.scale_y = 0.6
+        sub.label(text="Number keys 1-%d pick these, walking or not" % len(LENS_PRESETS))
         lay.prop(data, "lens", text="Focal Length")
-        col = lay.column(align=True)
-        col.prop(data, "clip_start", text="Clip Near")
-        col.prop(data, "clip_end", text="Clip Far")
 
-
-class BBSV_PT_focus(_BBPanel, Panel):
-    bl_label = "Focus & Depth of Field"
-    bl_idname = "BBSV_PT_focus"
-    flag = "show_dof"
-
-    @classmethod
-    def poll(cls, context):
-        return super().poll(context) and _active_cam(context) is not None
-
-    def draw(self, context):
-        lay = _locked_banner(self.layout, _active_cam(context))
-        data = _active_cam(context).data
+        lay.separator()
         if data.dof.focus_object is None:
             lay.operator("bb_sv.add_focus", icon="ADD")
         else:
             lay.label(text="Focus point: %s" % data.dof.focus_object.name, icon="PIVOT_CURSOR")
             lay.operator("bb_sv.focus_here", icon="RESTRICT_SELECT_OFF")
-            lay.prop(context.scene.bb_sv, "focus_pull", slider=True)
+            lay.prop(p, "focus_pull", slider=True)
         lay.prop(data.dof, "use_dof", text="Depth of Field")
-        if data.dof.use_dof:
-            col = lay.column(align=True)
-            col.prop(data.dof, "aperture_fstop", text="F-Stop")
-            if data.dof.focus_object is None:
-                col.prop(data.dof, "focus_distance", text="Focus Distance")
+        col = lay.column(align=True)
+        col.enabled = data.dof.use_dof        # greyed out, not hidden: the settings stay visible
+        col.prop(data.dof, "aperture_fstop", text="F-Stop")
+        if data.dof.focus_object is None:
+            col.prop(data.dof, "focus_distance", text="Focus Distance")
 
-
-class BBSV_PT_frame(_BBPanel, Panel):
-    bl_label = "Framing"
-    bl_idname = "BBSV_PT_frame"
-    flag = "show_frame"
-
-    def draw(self, context):
-        lay = self.layout
-        r = context.scene.render
-        lay.label(text="Frame shape")
-        row = lay.row(align=True)
-        for label, w, h in ASPECTS:
-            op = row.operator("bb_sv.set_aspect", text=label,
-                              depress=(r.resolution_x, r.resolution_y) == (w, h))
-            op.width, op.height = w, h
-        cam = _active_cam(context)
-        if cam:
-            d = cam.data
-            col = lay.column(align=True)
-            col.prop(d, "show_composition_thirds", text="Rule of Thirds")
-            col.prop(d, "show_composition_center", text="Centre Cross")
-            col.prop(d, "show_passepartout", text="Darken Outside Frame")
-            if d.show_passepartout:
-                col.prop(d, "passepartout_alpha", text="Darkness")
+        lay.separator()
+        col = lay.column(align=True)
+        col.prop(p, "tilt", text="Roll Step")
+        row = col.row(align=True)
+        op = row.operator("bb_sv.nudge", text="Roll Left")
+        op.axis, op.amount, op.kind = "Y", 1.0, "TILT"
+        row.operator("bb_sv.level_horizon", text="Reset Horizon", icon="ALIGN_JUSTIFY")
+        op = row.operator("bb_sv.nudge", text="Roll Right")
+        op.axis, op.amount, op.kind = "Y", -1.0, "TILT"
 
 
 class BBSV_PT_parts(_BBPanel, Panel):
     bl_label = "Show / Hide Set Parts"
     bl_idname = "BBSV_PT_parts"
+    bl_order = 5
     flag = "show_parts"
 
     def draw(self, context):
@@ -2657,7 +2954,8 @@ class BBSV_PT_parts(_BBPanel, Panel):
                 continue
             col = lay.column(align=True)
             op = col.operator("bb_sv.toggle_part", text=top.name,
-                              icon="HIDE_ON" if lc.hide_viewport else "HIDE_OFF", depress=not lc.hide_viewport)
+                              icon="HIDE_ON" if lc.hide_viewport else "HIDE_OFF",
+                              depress=not lc.hide_viewport)
             op.name = top.name
             if not lc.hide_viewport and top.children:
                 flow = col.grid_flow(columns=2, align=True)
@@ -2671,47 +2969,67 @@ class BBSV_PT_parts(_BBPanel, Panel):
                     op.name = ch.name
 
 
-class BBSV_PT_look(_BBPanel, Panel):
-    bl_label = "Look"
-    bl_idname = "BBSV_PT_look"
-    flag = "show_look"
+class BBSV_PT_settings(_BBPanel, Panel):
+    """The things you set once and forget: framing guides, the slower walk settings, which
+    panels are on, the tutorial. Closed by default so the panel above it stays short."""
 
-    def draw(self, context):
-        area = _view3d_area(context)
-        current = area.spaces.active.shading.type if area else ""
-        row = self.layout.row(align=True)
-        row.scale_y = 1.3
-        for label, mode in (("Fast", "SOLID"), ("Preview", "MATERIAL"), ("Wire", "WIREFRAME")):
-            row.operator("bb_sv.set_look", text=label, depress=current == mode).mode = mode
-        sub = self.layout.row()
-        sub.enabled = current in {"MATERIAL", "RENDERED"}       # the flags only bite in Preview
-        sub.prop(context.scene.bb_sv, "scene_lights", toggle=True, icon="LIGHT")
-        self.layout.label(text="For final quality, use Render Still in Capture", icon="INFO")
-
-
-class BBSV_PT_setup(_BBPanel, Panel):
-    bl_label = "Panel Setup"
-    bl_idname = "BBSV_PT_setup"
+    bl_label = "Settings"
+    bl_idname = "BBSV_PT_settings"
+    bl_order = 6
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
         lay = self.layout
         p = context.scene.bb_sv
-        lay.label(text="Show these sections:")
+        r = context.scene.render
+        cam = _active_cam(context)
+
+        lay.label(text="Frame shape", icon="IMAGE_PLANE")
+        row = lay.row(align=True)
+        for label, w, h in ASPECTS:
+            op = row.operator("bb_sv.set_aspect", text=label,
+                              depress=(r.resolution_x, r.resolution_y) == (w, h))
+            op.width, op.height = w, h
+        if cam:
+            col = lay.column(align=True)
+            col.prop(cam.data, "show_composition_thirds", text="Rule of Thirds")
+            col.prop(cam.data, "show_composition_center", text="Centre Cross")
+            col.prop(cam.data, "show_passepartout", text="Darken Outside Frame")
+            col = lay.column(align=True)
+            col.prop(cam.data, "clip_start", text="Clip Near")
+            col.prop(cam.data, "clip_end", text="Clip Far")
+
+        lay.separator()
+        lay.label(text="Walking", icon="VIEW_PAN")
         col = lay.column(align=True)
-        for key in ("show_capture", "show_walk", "show_cameras", "show_adjust", "show_lens", "show_dof",
-                    "show_frame", "show_parts", "show_look"):
+        col.prop(p, "sprint")
+        col.prop(p, "sensitivity")
+        col.prop(p, "invert_y")
+        col.prop(p, "fly_target")
+        col = lay.column(align=True)
+        col.operator("bb_sv.stand_on_floor", icon="TRIA_DOWN_BAR")
+        col.prop(p, "eye_height")
+
+        if cam:
+            lay.separator()
+            lay.label(text="Move the camera", icon="ORIENTATION_GIMBAL")
+            col = lay.column(align=True)
+            col.prop(p, "nudge")
+            grid = col.grid_flow(row_major=True, columns=2, align=True)
+            for label, axis, amt, icon in (
+                ("Left", "X", -1.0, "TRIA_LEFT"), ("Right", "X", 1.0, "TRIA_RIGHT"),
+                ("Down", "Y", -1.0, "TRIA_DOWN"), ("Up", "Y", 1.0, "TRIA_UP"),
+                ("Back", "Z", 1.0, "SORT_DESC"), ("Forward", "Z", -1.0, "SORT_ASC"),
+            ):
+                op = grid.operator("bb_sv.nudge", text=label, icon=icon)
+                op.axis, op.amount, op.kind = axis, amt, "MOVE"
+
+        lay.separator()
+        lay.label(text="Panels", icon="MENU_PANEL")
+        col = lay.column(align=True)
+        for key in ("show_cameras", "show_lens", "show_parts"):
             col.prop(p, key)
         lay.operator("bb_sv.tutorial", text="Show Tutorial", icon="HELP")
-        lay.separator()
-        if artist_on():
-            lay.operator("bb_sv.switch_mode", text="Switch to Easy Mode", icon="VIEW_CAMERA").easy = True
-            lay.operator("bb_sv.artist_exit", icon="LOOP_BACK")
-        else:
-            col = lay.column(align=True)
-            col.scale_y = 1.4
-            col.operator("bb_sv.artist_enter", icon="FULLSCREEN_ENTER")
-            col.operator("bb_sv.artist_enter", text="Enter Easy Mode", icon="VIEW_CAMERA").easy = True
 
 
 CLASSES = (
@@ -2743,21 +3061,20 @@ CLASSES = (
     BBSV_OT_delete_camera,
     BBSV_OT_capture,
     BBSV_OT_clear_cameras,
+    BBSV_OT_refresh_map,
     BBSV_OT_open_captures,
     BBSV_OT_tutorial,
     BBSV_OT_easy_capture,
+    BBSV_OT_easy_depth,
+    BBSV_OT_easy_depth_multiply,
     BBSV_PT_easy,
     BBSV_PT_easy_more,
-    BBSV_PT_capture,
-    BBSV_PT_navigate,
+    BBSV_PT_mode,
+    BBSV_PT_shot,
     BBSV_PT_cameras,
-    BBSV_PT_adjust,
-    BBSV_PT_lens,
-    BBSV_PT_focus,
-    BBSV_PT_frame,
+    BBSV_PT_camera_settings,
     BBSV_PT_parts,
-    BBSV_PT_look,
-    BBSV_PT_setup,
+    BBSV_PT_settings,
 )
 
 
@@ -2787,6 +3104,7 @@ def unregister():
     if _OVERLAY["handle"] is not None:
         bpy.types.SpaceView3D.draw_handler_remove(_OVERLAY["handle"], "WINDOW")
         _OVERLAY["handle"] = None
+    _map_enable(False)                 # the mini map draws from its own handler
     if _on_load in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_on_load)
     _ARTIST["on"] = False
