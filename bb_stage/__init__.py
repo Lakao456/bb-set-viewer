@@ -22,7 +22,7 @@ from mathutils import Matrix, Quaternion, Vector
 bl_info = {
     "name": "BB Stage",
     "author": "Beta Builder",
-    "version": (0, 11, 0),
+    "version": (0, 12, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > BB Stage",
     "category": "3D View",
@@ -123,10 +123,80 @@ def master_scene():
 
 
 def fstate():
-    """File-level state (Stage Mode on/off, Easy/Artist, floor heights, level collections)
-    lives on the set scene, so every staging reads the same values."""
+    """File-level state (Easy/Artist, handles, Edit Studio) lives on the first set scene, so
+    every staging reads the same values. Floors and plan cuts are per set scene: floor_state."""
     m = master_scene()
     return getattr(m, "bb_st", None) if m is not None else None
+
+
+# A file can hold several set scenes: a house, its gully, an interior, an exterior (Aman,
+# 5 Oct 2026). Each staging plays in one of them and links that scene's collections; the
+# ones offered for staging are ticked in Stagings › Set scenes (none ticked: all of them).
+
+def set_scenes(offered=True):
+    sets = [s for s in bpy.data.scenes if not is_staging(s)]
+    if not offered:
+        return sets
+    ticked = [s for s in sets if getattr(s, "bb_st", None) is not None and s.bb_st.stageable]
+    return ticked or sets
+
+
+def _infer_set_scene(staging):
+    """Older stagings did not record their set scene: the one whose collections they link."""
+    roots = layer_colls(staging, "SET")
+    if not roots:
+        return None
+    kids = {c.name for c in roots[0].children}
+    obs = {o.name for o in roots[0].objects}
+    best = None
+    for sc in set_scenes(offered=False):
+        score = (len(kids & {c.name for c in sc.collection.children})
+                 + len(obs & {o.name for o in sc.collection.objects}))
+        if score and (best is None or score > best[0]):
+            best = (score, sc)
+    return best[1] if best else None
+
+
+def set_scene_of(scene):
+    """The set scene a staging plays in (a set scene is its own)."""
+    if scene is None or not is_staging(scene):
+        return scene
+    src = scene.bb_st.set_scene
+    if src is not None and bpy.data.scenes.get(src.name) == src and not is_staging(src):
+        return src
+    return _infer_set_scene(scene) or master_scene()
+
+
+def floor_state(scene):
+    """Floor heights and plan cuts of the set scene this staging plays in."""
+    src = set_scene_of(scene)
+    return getattr(src, "bb_st", None) if src is not None else None
+
+
+def stagings_of(set_scene):
+    return [s for s in stagings() if set_scene_of(s) == set_scene]
+
+
+def set_instancers(scene):
+    """Collection instances in the set: a house placed in a lane from its own scene."""
+    roots = layer_colls(scene, "SET") if is_staging(scene) else [scene.collection]
+    return [o for c in roots for o in coll_objects(c)
+            if o.type == 'EMPTY' and o.instance_type == 'COLLECTION' and o.instance_collection is not None]
+
+
+def instanced_objects(scene):
+    """Every object a set shows through its collection instances (nested ones too)."""
+    seen, out, stack = set(), [], [e.instance_collection for e in set_instancers(scene)]
+    while stack:
+        c = stack.pop()
+        if c.name in seen:
+            continue
+        seen.add(c.name)
+        for o in coll_objects(c):
+            out.append(o)
+            if o.instance_type == 'COLLECTION' and o.instance_collection is not None:
+                stack.append(o.instance_collection)
+    return out
 
 
 def _root_child(scene, coll):
@@ -198,6 +268,10 @@ def migrate_staging(scene):
     b = boundary_of(scene)
     if b is not None and st.boundary != b:
         st.boundary = b
+    if st.set_scene is None or bpy.data.scenes.get(st.set_scene.name) != st.set_scene:
+        src = _infer_set_scene(scene) or master_scene()
+        if src is not None and src != scene:
+            st.set_scene = src
     for c in layer_colls(scene, "SET"):
         if not c.hide_select:
             c.hide_select = True
@@ -458,22 +532,22 @@ def apply_view_state(scene, context=None):
 def ghost_tint(scene, on):
     """Fade the SET to translucent grey via object-colour alpha. Only panes in solid shading
     with OBJECT colour show it, so camera panes stay clean. Undone before every save."""
-    for coll in layer_colls(scene, "SET"):
-        for ob in coll_objects(coll):
-            try:
-                if on and ob.type in SET_TYPES:     # not the set's own cameras / empties
-                    if TINT_KEY not in ob:
-                        ob[TINT_KEY] = list(ob.color)
-                    if _rgba_differs(ob.color, GHOST_RGBA):
-                        ob.color = GHOST_RGBA
-                elif TINT_KEY in ob:
-                    ob.color = ob[TINT_KEY]
-                    del ob[TINT_KEY]
-                if DT_BACKUP_KEY in ob:
-                    ob.display_type = ob[DT_BACKUP_KEY]
-                    del ob[DT_BACKUP_KEY]
-            except Exception:
-                pass
+    obs = [ob for coll in layer_colls(scene, "SET") for ob in coll_objects(coll)] + instanced_objects(scene)
+    for ob in obs:
+        try:
+            if on and ob.type in SET_TYPES:     # not the set's own cameras / empties
+                if TINT_KEY not in ob:
+                    ob[TINT_KEY] = list(ob.color)
+                if _rgba_differs(ob.color, GHOST_RGBA):
+                    ob.color = GHOST_RGBA
+            elif TINT_KEY in ob:
+                ob.color = ob[TINT_KEY]
+                del ob[TINT_KEY]
+            if DT_BACKUP_KEY in ob:
+                ob.display_type = ob[DT_BACKUP_KEY]
+                del ob[DT_BACKUP_KEY]
+        except Exception:
+            pass
 
 
 def untint_everything():
@@ -1366,6 +1440,10 @@ class BBST_Props(bpy.types.PropertyGroup):
     props_coll: bpy.props.PointerProperty(type=bpy.types.Collection)
     cams_coll: bpy.props.PointerProperty(type=bpy.types.Collection)
     boundary: bpy.props.PointerProperty(type=bpy.types.Object)
+    set_scene: bpy.props.PointerProperty(type=bpy.types.Scene)      # staging: the set scene it plays in
+    stageable: bpy.props.BoolProperty(
+        name="Offer for staging", default=False,
+        description="New Staging offers this scene as a set to stage in (none ticked: every scene)")
     data_version: bpy.props.IntProperty(default=0)
     play_level: bpy.props.EnumProperty(name="Plays on", items=LEVEL_ITEMS, default='GROUND',
                                        update=_play_level_update)
@@ -1403,14 +1481,26 @@ class BBST_Props(bpy.types.PropertyGroup):
 
 # ------------------------------------------------------------------ staging builder
 
+def _evaluated_matrix(ob, dg):
+    """World matrix as evaluated: what a file stores for objects in a scene nobody has opened
+    (or in a collection the scene excludes) can be a stale identity."""
+    if dg is not None:
+        try:
+            return ob.evaluated_get(dg).matrix_world.copy()
+        except Exception:
+            pass
+    return ob.matrix_world.copy()
+
+
 def set_bounds_center(scene):
     """Where the set's things are: the median of mesh positions (a giant ground plane or a
     stray object far away does not drag it off the building)."""
     xs, ys = [], []
+    dg = _scene_depsgraph(scene)
     for c in layer_colls(scene, "SET"):
         for ob in coll_objects(c):
             if ob.type == 'MESH':
-                p = ob.matrix_world.translation
+                p = _evaluated_matrix(ob, dg).translation
                 xs.append(p.x)
                 ys.append(p.y)
     if not xs:
@@ -1471,7 +1561,7 @@ def detect_floor_z(scene, x, y, level):
     surface in a band just above that level's detected floor (rugs and slabs count, tables do not).
     The band was anchored on the plan cut, which v0.8 puts 2.2 m above the ground floor, so upper-
     floor stagings landed at 2.7 m on Daaruwala and a raised ground floor (Shefali 1.22 m) was missed."""
-    fs = fstate()
+    fs = floor_state(scene)
     l1cut = fs.level1_cut if fs is not None else 5.5
     known = floors_known(fs)
     if level == 'L1':
@@ -1487,6 +1577,7 @@ def detect_floor_z(scene, x, y, level):
     set_names = set()
     for c in layer_colls(scene, "SET"):
         set_names |= {o.name for o in coll_objects(c)}
+    set_names |= {o.name for o in instanced_objects(scene)}     # a house placed by instance
     if not set_names:
         return round(base, 4)
     origin = Vector((x, y, top))
@@ -1688,25 +1779,82 @@ def spawn_point(scene, n, studio_only=True):
                    c.y + max(-lim_y, min(lim_y, r * math.sin(ang))), c.z))
 
 
+_SET_ITEMS = []      # Blender keeps only pointers into dynamic enum items: hold on to them
+
+
+def _set_scene_items(self, context):
+    _SET_ITEMS.clear()
+    for i, sc in enumerate(set_scenes()):
+        n = len(stagings_of(sc))
+        _SET_ITEMS.append((sc.name, sc.name, f"Stage in {sc.name} ({n} staging{'' if n == 1 else 's'} so far)",
+                           'SCENE_DATA', i))
+    return _SET_ITEMS or [("", "No set scene", "", 'ERROR', 0)]
+
+
+def link_set(sc, src):
+    """The set scene's collections and loose objects, linked (never copied) under the staging's
+    one unselectable SET wrapper: the model can only be edited in its own scene."""
+    st = sc.bb_st
+    roots = layer_colls(sc, "SET")
+    if roots:
+        wrapper = roots[0]
+    else:
+        wrapper = bpy.data.collections.new(f"SET · {staging_label(sc)}")
+        wrapper[LAYER_KEY] = "SET"
+        sc.collection.children.link(wrapper)
+        st.set_coll = wrapper
+    wrapper.hide_select = True
+    for c in list(wrapper.children):
+        wrapper.children.unlink(c)
+    for ob in list(wrapper.objects):
+        wrapper.objects.unlink(ob)
+    for coll in src.collection.children:
+        if coll.get(LAYER_KEY) in ("SET", "STUDIO", "STAGE"):
+            continue
+        wrapper.children.link(coll)
+    for ob in src.collection.objects:
+        if ob.get(ROLE_KEY) is None:
+            wrapper.objects.link(ob)
+    st.set_scene = src
+    return wrapper
+
+
 class BBST_OT_new_staging(bpy.types.Operator):
-    """Create a new staging: one studio setup for one scene of this set"""
+    """Create a new staging: one studio setup for one scene of the script, in one of this file's set scenes"""
     bl_idname = "bbst.new_staging"
     bl_label = "New Staging"
     bl_options = {'REGISTER', 'UNDO'}
 
+    set_name: bpy.props.EnumProperty(name="Stage in", items=_set_scene_items,
+                                     description="The set scene this staging plays in (Settings: which scenes are offered)")
     label: bpy.props.StringProperty(name="Staging name", default="")
     level: bpy.props.EnumProperty(name="Plays on", items=LEVEL_ITEMS, default='GROUND',
                                   description="Which floor this scene plays on — everything above it hides")
 
     def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self)
+        cur = set_scene_of(context.scene)
+        if cur is not None and cur.name in {sc.name for sc in set_scenes()}:
+            self.set_name = cur.name
+        return context.window_manager.invoke_props_dialog(self, width=380)
+
+    def draw(self, context):
+        lay = self.layout
+        lay.prop(self, "set_name")
+        lay.prop(self, "label")
+        src = bpy.data.scenes.get(self.set_name)
+        fs = getattr(src, "bb_st", None)
+        if fs is None or not floors_known(fs) or fs.has_upper:
+            lay.prop(self, "level")
 
     def execute(self, context):
         label = " ".join(self.label.split())
         if not label:
             self.report({'ERROR'}, "Give the staging a name")
             return {'CANCELLED'}
-        src = master_scene()
+        src = bpy.data.scenes.get(self.set_name) if self.set_name else None
+        if src is None or is_staging(src):
+            offered = set_scenes()
+            src = offered[0] if offered else None
         if src is None:
             return {'CANCELLED'}
         name = STG_PREFIX + label
@@ -1723,19 +1871,7 @@ class BBST_OT_new_staging(bpy.types.Operator):
         sc.world = src.world
         sc.frame_start, sc.frame_end = 1, 240
         st = sc.bb_st
-        # the whole set, linked (never copied) under one unselectable wrapper: the model can
-        # only be edited in its own scene (Aman, 5 Oct 2026)
-        wrapper = bpy.data.collections.new(f"SET · {label}")
-        wrapper[LAYER_KEY] = "SET"
-        wrapper.hide_select = True
-        sc.collection.children.link(wrapper)
-        for coll in src.collection.children:
-            if coll.get(LAYER_KEY) in ("SET", "STUDIO", "STAGE"):
-                continue
-            wrapper.children.link(coll)
-        for ob in src.collection.objects:
-            if ob.get(ROLE_KEY) is None:
-                wrapper.objects.link(ob)
+        wrapper = link_set(sc, src)
         studio = bpy.data.collections.new(f"STUDIO · {label}")
         studio[LAYER_KEY] = "STUDIO"
         sc.collection.children.link(studio)
@@ -1750,9 +1886,9 @@ class BBST_OT_new_staging(bpy.types.Operator):
             stage.children.link(c)
             subs[child] = c
         st.chars_coll, st.props_coll, st.cams_coll = subs["Characters"], subs["Props"], subs["Cameras"]
-        fs = fstate()
+        fs = floor_state(sc)
         if fs is not None and not floors_known(fs):
-            store_floors(fs, sc)        # first staging of this set: find its floors and plan cuts
+            store_floors(fs, sc)        # first staging of this set scene: find its floors and plan cuts
         level = self.level
         if level == 'L1' and fs is not None and not fs.has_upper:
             level = 'GROUND'
@@ -1783,7 +1919,52 @@ class BBST_OT_new_staging(bpy.types.Operator):
             _build_stage_screen(sc.name)
         else:
             enter_stage_mode(context, sc)
-        self.report({'INFO'}, f"Staging '{label}' created — now drag the studio space where the scene plays")
+        self.report({'INFO'}, f"Staging '{label}' in {src.name} — now drag the studio space where the scene plays")
+        return {'FINISHED'}
+
+
+class BBST_OT_staging_set(bpy.types.Operator):
+    """Change the set scene this staging plays in. Its studio, characters, cameras and beats stay; place the studio space again"""
+    bl_idname = "bbst.staging_set"
+    bl_label = "Plays In"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    scene_name: bpy.props.StringProperty()
+    set_name: bpy.props.EnumProperty(name="Set scene", items=_set_scene_items)
+
+    def invoke(self, context, event):
+        sc = bpy.data.scenes.get(self.scene_name) or context.scene
+        cur = set_scene_of(sc)
+        if cur is not None and cur.name in {x.name for x in set_scenes()}:
+            self.set_name = cur.name
+        return context.window_manager.invoke_props_dialog(self, width=360)
+
+    def execute(self, context):
+        sc = bpy.data.scenes.get(self.scene_name) or context.scene
+        src = bpy.data.scenes.get(self.set_name)
+        if not is_staging(sc) or src is None or is_staging(src):
+            return {'CANCELLED'}
+        if src == set_scene_of(sc) and sc.bb_st.set_scene == src:
+            return {'FINISHED'}
+        untint_everything()             # the old set's ghost tint
+        link_set(sc, src)
+        st = sc.bb_st
+        sc.world = src.world
+        fs = floor_state(sc)
+        if fs is not None and not floors_known(fs):
+            store_floors(fs, sc)
+        if st.play_level == 'L1' and fs is not None and not fs.has_upper:
+            _QUIET["floor"] = True
+            try:
+                st.play_level = 'GROUND'
+            finally:
+                _QUIET["floor"] = False
+            st.active_level = 'GROUND'
+        refresh_floor(sc)
+        st.needs_place = True
+        normalize_view_layer(sc)
+        request_sync(0.0)
+        self.report({'INFO'}, f"{staging_label(sc)} now plays in {src.name}: place the studio space")
         return {'FINISHED'}
 
 
@@ -1807,7 +1988,7 @@ The set model and the other stagings are untouched"""
         others = [s for s in stagings() if s != sc]
         for win in context.window_manager.windows:
             if win.scene == sc:
-                win.scene = others[0] if others else master_scene()
+                win.scene = others[0] if others else (set_scene_of(sc) or master_scene())
         doomed_colls = []
         for root in own_roots:
             doomed_colls += [root] + list(root.children_recursive)
@@ -2925,7 +3106,7 @@ def desired_names(plan, role, world):
 
 def plan_cut(scene, space):
     """Section-cut height for the working pane, or None for no cut."""
-    fs = fstate()
+    fs = floor_state(scene)
     st = scene.bb_st
     g, u = (fs.level1_cut, fs.ceiling_cut) if fs is not None else (5.5, 9.5)
     if st.active_level == 'GROUND':
@@ -3326,7 +3507,7 @@ class BBST_OT_pane_level(bpy.types.Operator):
     def execute(self, context):
         if not is_staging(context.scene):
             return {'CANCELLED'}
-        fs = fstate()
+        fs = floor_state(context.scene)
         if self.level == 'L1' and fs is not None and not fs.has_upper:
             self.report({'WARNING'}, "This set has one floor (Settings: This set has an upper floor)")
             return {'CANCELLED'}
@@ -3674,10 +3855,11 @@ def _bbst_after_exit():
     for s in stagings():
         apply_studio_lock(s, False)     # plain Blender: everything clickable again
     _restore_foreign_v3d_panels()
-    ms = master_scene()
     for w in bpy.context.window_manager.windows:
-        if w.as_pointer() == _EXIT["win"] and is_staging(w.scene) and ms is not None:
-            w.scene = ms        # back on the set scene, not the staging's
+        if w.as_pointer() == _EXIT["win"] and is_staging(w.scene):
+            back = set_scene_of(w.scene)
+            if back is not None:
+                w.scene = back      # back on the set scene this staging plays in
     return None
 
 
@@ -3699,7 +3881,11 @@ class BBST_OT_enter_stage(bpy.types.Operator):
             apply_mode_tool(context.window)        # switching Easy ⇄ Artist changes the tool
             request_sync(0.0)
             return {'FINISHED'}
-        scene = context.scene if is_staging(context.scene) else (_last_staging(context.window) or (stagings() or [None])[0])
+        mine = [] if is_staging(context.scene) else stagings_of(context.scene)
+        last = _last_staging(context.window)
+        scene = (context.scene if is_staging(context.scene)
+                 else (last if last in mine else None) or (mine[0] if mine else None)
+                 or last or (stagings() or [None])[0])
         if scene is None:
             self.report({'ERROR'}, "No stagings yet — use New Staging first")
             return {'CANCELLED'}
@@ -4440,13 +4626,14 @@ BLOCKED_KEYS = [
 _UPPER_NAME = re.compile(r"\b(loft|mezzanine|mezz|upper|first floor|level ?1)\b", re.I)
 
 
-def _named_upper_floor(ground):
+def _named_upper_floor(ground, scene=None):
     """A loft is too small for the area vote (Jai's: 8.6 m2): trust the set's own collection
     names (Loft, Mezzanine, Upper floor...) and take the height of their biggest flat top face."""
     import numpy as np
-    m = master_scene()
+    m = set_scene_of(scene) if scene is not None else master_scene()
     if m is None:
         return None
+    dg = _scene_depsgraph(scene) if scene is not None else None
     best = None
     for c in m.collection.children_recursive:
         if c.get(LAYER_KEY) or not _UPPER_NAME.search(c.name):
@@ -4462,7 +4649,7 @@ def _named_upper_floor(ground):
             me.polygons.foreach_get("normal", nor)
             me.polygons.foreach_get("center", cen)
             me.polygons.foreach_get("area", ar)
-            mw = np.array(ob.matrix_world, dtype=np.float64)
+            mw = np.array(_evaluated_matrix(ob, dg), dtype=np.float64)
             r3 = mw[:3, :3]
             nw = nor.reshape(-1, 3) @ r3.T
             ln = np.linalg.norm(nw, axis=1)
@@ -4507,11 +4694,13 @@ def detect_floors(scene):
     seen, zs, areas = set(), [], []
     down_z, down_a = [], []
     vl = scene.view_layers[0]      # this scene's own view layer, whatever the context is
-    for c in layer_colls(scene, "SET") or [master_scene().collection]:
+    dg = _scene_depsgraph(scene)
+    for c in layer_colls(scene, "SET") or [set_scene_of(scene).collection]:
         for ob in coll_objects(c):
             if ob.type != 'MESH' or ob.data is None or not ob.visible_get(view_layer=vl):
                 continue
-            key = (ob.data.name, tuple(round(v, 3) for row in ob.matrix_world for v in row))
+            mw = _evaluated_matrix(ob, dg)
+            key = (ob.data.name, tuple(round(v, 3) for row in mw for v in row))
             if key in seen:
                 continue
             seen.add(key)
@@ -4525,7 +4714,7 @@ def detect_floors(scene):
             me.polygons.foreach_get("normal", nor)
             me.polygons.foreach_get("center", cen)
             me.polygons.foreach_get("area", area)
-            m = np.array(ob.matrix_world, dtype=np.float64)
+            m = np.array(mw, dtype=np.float64)
             r3 = m[:3, :3]
             nw = (nor.reshape(-1, 3) @ r3.T)
             ln = np.linalg.norm(nw, axis=1)
@@ -4539,6 +4728,36 @@ def detect_floors(scene):
             areas.append(area[up] * scale)
             down_z.append(cw[dn, 2])
             down_a.append(area[dn] * scale)
+    if set_instancers(scene):
+        insts = set(set_instancers(scene))
+        for inst in (dg.object_instances if dg is not None else []):
+            if not (inst.is_instance and inst.parent is not None and inst.parent.original in insts):
+                continue
+            ob = inst.object
+            if ob.type != 'MESH' or ob.data is None:
+                continue
+            me = ob.data
+            n = len(me.polygons)
+            if n == 0:
+                continue
+            nor = np.empty(n * 3, dtype=np.float32)
+            cen = np.empty(n * 3, dtype=np.float32)
+            area = np.empty(n, dtype=np.float32)
+            me.polygons.foreach_get("normal", nor)
+            me.polygons.foreach_get("center", cen)
+            me.polygons.foreach_get("area", area)
+            m = np.array(inst.matrix_world, dtype=np.float64)
+            r3 = m[:3, :3]
+            nw = (nor.reshape(-1, 3) @ r3.T)
+            ln = np.linalg.norm(nw, axis=1)
+            ln[ln == 0] = 1
+            nz = nw[:, 2] / ln
+            cw = cen.reshape(-1, 3) @ r3.T + m[:3, 3]
+            scale = abs(np.linalg.det(r3)) ** (2 / 3)
+            zs.append(cw[nz > 0.9, 2])
+            areas.append(area[nz > 0.9] * scale)
+            down_z.append(cw[nz < -0.9, 2])
+            down_a.append(area[nz < -0.9] * scale)
     if not zs:
         return 0.0, None, 5.5, 9.5
     z = np.concatenate(zs)
@@ -4558,7 +4777,7 @@ def detect_floors(scene):
     upper = next((p[0] for p in big if p[0] >= ground + 2.0 and p[1] >= 25.0), None)
     named = None
     if upper is None:
-        named = _named_upper_floor(ground)    # a loft is too small for the area vote
+        named = _named_upper_floor(ground, scene)    # a loft is too small for the area vote
         if named is not None:
             upper = named[0]
     dz = np.concatenate(down_z) if down_z else np.array([])
@@ -4602,10 +4821,12 @@ class BBST_OT_detect_floors(bpy.types.Operator):
     bl_label = "Detect Floors"
 
     def execute(self, context):
-        fs = fstate()
-        scene = context.scene if is_staging(context.scene) else master_scene()
+        scene = context.scene
+        fs = floor_state(scene)
+        if fs is None:
+            return {'CANCELLED'}
         g, u, gc, uc = store_floors(fs, scene)
-        for s in stagings():
+        for s in stagings_of(set_scene_of(scene)):
             refresh_floor(s)
         request_sync(0.0)
         msg = f"Ground floor at {g:.2f} m" + (f", upper floor at {u:.2f} m" if u is not None else ", single level")
@@ -4987,14 +5208,27 @@ def _mode():
 
 
 def draw_scenes(lay, context):
+    """Stagings under the set scene each plays in (a house, its gully, an interior...)."""
     scene = context.scene
     artist = _mode() == 'ARTIST'
-    for s in stagings():
-        r = lay.row(align=True)
-        r.operator("bbst.goto_scene", text=staging_label(s), icon='VIEW_CAMERA',
-                   depress=(s == scene)).scene_name = s.name
-        if artist:
-            r.operator("bbst.delete_staging", text="", icon='X').scene_name = s.name
+    offered = set_scenes()
+    for src in set_scenes(offered=False):
+        mine = stagings_of(src)
+        if src not in offered and not mine:
+            continue
+        col = lay.column(align=True)
+        col.label(text=src.name, icon='SCENE_DATA')
+        for s in mine:
+            r = col.row(align=True)
+            r.operator("bbst.goto_scene", text=staging_label(s), icon='VIEW_CAMERA',
+                       depress=(s == scene)).scene_name = s.name
+            if artist:
+                r.operator("bbst.staging_set", text="", icon='SCENE_DATA').scene_name = s.name
+                r.operator("bbst.delete_staging", text="", icon='X').scene_name = s.name
+        if not mine:
+            sub = col.row()
+            sub.enabled = False
+            sub.label(text="No stagings here yet")
     if artist:
         lay.operator("bbst.new_staging", icon='ADD')
 
@@ -5181,16 +5415,23 @@ def draw_settings(lay, context):
     col.prop(st, "wall_height")
     col.operator("bbst.rebuild_shell", icon='FILE_REFRESH')
     col = lay.column(align=True)
-    col.label(text="Floors of this set:")
-    if fs is not None:
-        col.prop(fs, "level1_cut", text="Ground floor plan cut (m)")
-        col.prop(fs, "ceiling_cut", text="Upper floor plan cut (m)")
-    if fs is not None:
-        col.prop(fs, "has_upper")
+    src = set_scene_of(context.scene)
+    ff = floor_state(context.scene)
+    col.label(text=f"Floors of {src.name if src else 'this set'}:")
+    if ff is not None:
+        col.prop(ff, "level1_cut", text="Ground floor plan cut (m)")
+        col.prop(ff, "ceiling_cut", text="Upper floor plan cut (m)")
+        col.prop(ff, "has_upper")
     col.operator("bbst.detect_floors", icon='VIEWZOOM')
     col = lay.column(align=True)
     col.prop(st, "play_level")
     col.prop(st, "floor_z")
+    col = lay.column(align=True)
+    col.label(text="Set scenes offered in New Staging:")
+    for sc in set_scenes(offered=False):
+        col.prop(sc.bb_st, "stageable", text=sc.name)
+    if not any(sc.bb_st.stageable for sc in set_scenes(offered=False)):
+        col.label(text="None ticked: every scene is offered", icon='INFO')
     lay.prop(st, "beat_spacing")
     lay.prop(st, "black_outside")
     if fs is not None:
@@ -5237,8 +5478,7 @@ class BBST_PT_entry(_NPanel, bpy.types.Panel):
             if stagings():
                 col.operator("bbst.enter_stage", text="Enter Artist Mode", icon='FULLSCREEN_ENTER').easy = False
                 col.operator("bbst.enter_stage", text="Enter Easy Mode", icon='VIEW_CAMERA').easy = True
-            else:
-                col.operator("bbst.new_staging", text="New Staging…", icon='ADD')
+            col.operator("bbst.new_staging", text="New Staging…", icon='ADD')
         else:
             if _mode() == 'ARTIST':
                 col.operator("bbst.enter_stage", text="Switch to Easy Mode", icon='VIEW_CAMERA').easy = True
@@ -5458,7 +5698,7 @@ PANEL_CLASSES = [
 
 CLASSES = [
     BBST_Beat, BBST_Path, BBST_Props,
-    BBST_OT_new_staging, BBST_OT_goto_scene, BBST_OT_delete_staging,
+    BBST_OT_new_staging, BBST_OT_staging_set, BBST_OT_goto_scene, BBST_OT_delete_staging,
     BBST_OT_add_kit,
     BBST_OT_pick_standin, BBST_OT_pick_match,
     BBST_OT_add_char, BBST_OT_add_prop, BBST_OT_obj_action, BBST_UL_objects, BBST_OT_turn,
