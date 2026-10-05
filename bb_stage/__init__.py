@@ -22,7 +22,7 @@ from mathutils import Matrix, Quaternion, Vector
 bl_info = {
     "name": "BB Stage",
     "author": "Beta Builder",
-    "version": (0, 12, 0),
+    "version": (0, 13, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > BB Stage",
     "category": "3D View",
@@ -35,6 +35,7 @@ SOURCE_KEY = "bb_st_source"        # stand-in: name of the set object it stands 
 STANDIN_KEY = "bb_st_standin"      # prop flag: placeholder that must never appear in outputs
 DT_BACKUP_KEY = "bb_st_dt0"        # ghost mode: original display_type backup
 LOCK_KEY = "bb_st_locked"
+CAM_KEY = "bb_st_keyed"            # camera: moves on the beats (static cameras carry no keys)
 
 PEG_COLORS = [
     (0.90, 0.25, 0.20, 1.0), (0.20, 0.55, 0.95, 1.0), (0.25, 0.75, 0.30, 1.0),
@@ -277,6 +278,13 @@ def migrate_staging(scene):
             c.hide_select = True
     upgrade_beats(scene)
     ensure_beat_uids(scene)
+    for cam in stage_cams(scene):
+        if not cam.show_name:
+            cam.show_name = True
+        if st.key_cameras and not cam.get(CAM_KEY):
+            cam[CAM_KEY] = True         # the old "Key cameras on beats" switch, per camera now
+    if st.key_cameras:
+        st.key_cameras = False
     if not st.shell_built and boundary_of(scene) is not None and layer_colls(scene, "STUDIO"):
         build_studio_shell(scene)
     for c in layer_colls(scene, "STUDIO"):
@@ -652,14 +660,37 @@ def sync_markers(scene):
 
 
 def keyed_objects(scene):
+    """Everything the beats key: characters, props, and the cameras set to move on the beats
+    (one on a gimbal while the others stay put, Aman 5 Oct 2026)."""
     st = scene.bb_st
     obs = stage_objects(scene, roles=("char", "prop"))
-    if st.key_cameras:
-        obs += [o for o in stage_objects(scene, roles=("cam",))]
-        cams = sub_coll(scene, "STAGE", "Cameras")
-        if cams:
-            obs += [o for o in cams.objects if o.type == 'CAMERA' and o not in obs]
+    obs += [c for c in stage_cams(scene) if st.key_cameras or c.get(CAM_KEY)]
     return obs
+
+
+def cam_moves(ob):
+    return bool(ob is not None and ob.get(CAM_KEY))
+
+
+def set_cam_moves(scene, cam, on):
+    """On: the camera is keyed on every beat at its current pose (then move it on a beat and
+    Save Beat). Off: its beat keys and paths go, it stays where it is now."""
+    st = scene.bb_st
+    if on:
+        cam[CAM_KEY] = True
+        for b in st.beats:
+            for f in sorted({b.frame, beat_out(b)}):
+                cam.keyframe_insert("location", frame=f, group="BB Stage")
+                cam.keyframe_insert("rotation_euler", frame=f, group="BB Stage")
+        return
+    for k in reversed(range(len(st.paths))):
+        if st.paths[k].owner == cam:
+            remove_path(scene, k)
+    loc, rot = cam.location.copy(), cam.rotation_euler.copy()
+    _drop_fcurves(cam, {"location", "rotation_euler"})
+    cam.location, cam.rotation_euler = loc, rot
+    if CAM_KEY in cam:
+        del cam[CAM_KEY]
 
 
 def beat_out(b):
@@ -1042,6 +1073,13 @@ def path_world_points(rec, per_seg=12):
     return out
 
 
+CAM_PATH_RGBA = (1.0, 0.72, 0.15, 1.0)     # camera moves read amber in the plan
+
+
+def path_color(owner):
+    return CAM_PATH_RGBA if owner.type == 'CAMERA' else tuple(owner.color)
+
+
 def _write_keys(ob, data_path, pts, interp):
     """Make one F-curve hold exactly these keys; True when something changed."""
     ad = ob.animation_data
@@ -1079,6 +1117,17 @@ def _drop_fcurves(ob, data_paths):
                     cb.fcurves.remove(fc)
 
 
+def _face_path_update(rec, context):
+    scene = rec.id_data
+    if not isinstance(scene, bpy.types.Scene):
+        return
+    i = beat_index_of(scene.bb_st, rec.beat_uid)
+    if i:
+        time_path(scene, rec, i)
+        if rec.face_path:
+            set_arrival_heading(scene, rec, i)
+
+
 def time_path(scene, rec, i):
     """Key the walk on the beat timing: the follower goes 0 → 1 along the curve over the move
     (a short start and stop, steady in between); the walker follows it from the frame after
@@ -1100,8 +1149,11 @@ def time_path(scene, rec, i):
     _write_keys(fol, offset, [(s, 0.0), (s + a, v * a / 2), (e - a, 1.0 - v * a / 2), (e, 1.0)], 'BEZIER')
     _write_keys(owner, f'constraints["{loc_n}"].influence', [(s, 0.0), (s + 1, 1.0), (e, 0.0)], 'CONSTANT')
     r = max(1, min(round(0.3 * f), span // 3))
-    _write_keys(owner, f'constraints["{rot_n}"].influence',
-                [(s, 0.0), (s + r, 1.0), (e - r, 1.0), (e, 0.0)], 'LINEAR')
+    if rec.face_path:
+        _write_keys(owner, f'constraints["{rot_n}"].influence',
+                    [(s, 0.0), (s + r, 1.0), (e - r, 1.0), (e, 0.0)], 'LINEAR')
+    else:       # keeps the framing keyed on the beats
+        _write_keys(owner, f'constraints["{rot_n}"].influence', [(s, 0.0)], 'CONSTANT')
 
 
 def fit_path(scene, rec, i):
@@ -1134,6 +1186,8 @@ def path_heading_end(rec):
 
 def set_arrival_heading(scene, rec, i):
     """The walker lands on beat i facing along the end of its path."""
+    if not rec.face_path:
+        return
     th = path_heading_end(rec)
     ob = rec.owner
     ad = ob.animation_data
@@ -1186,10 +1240,10 @@ def create_path(scene, ob, i):
     cu.use_path = True
     cu.bevel_depth = 0.03
     cu.bevel_resolution = 2
-    cu.materials.append(ensure_flat_material(f"BB Path · {ob.name}", tuple(ob.color)))
+    cu.materials.append(ensure_flat_material(f"BB Path · {ob.name}", path_color(ob)))
     curve = bpy.data.objects.new(cname, cu)
     curve[ROLE_KEY] = PATH_ROLE
-    curve.color = ob.color
+    curve.color = path_color(ob)
     curve.hide_render = True
     curve.lock_location = (True, True, True)
     curve.lock_rotation = (True, True, True)
@@ -1216,10 +1270,11 @@ def create_path(scene, ob, i):
     cr = ob.constraints.new('COPY_ROTATION')
     cr.name = rot_n
     cr.target = fol
-    cr.use_x = cr.use_y = False                 # turn only: walkers stay upright
+    cr.use_x = cr.use_y = False                 # turn only: walkers stay upright, cameras keep their tilt
     cl.influence = cr.influence = 0.0
     rec = st.paths.add()
     rec.owner, rec.curve, rec.follower, rec.beat_uid = ob, curve, fol, uid
+    rec["face_path"] = ob.get(ROLE_KEY) != "cam"     # a camera keeps its framing unless asked
     _set_path_shape(rec, p0, _start_shape(ob, p0, p1), p1)
     time_path(scene, rec, i)
     set_arrival_heading(scene, rec, i)
@@ -1253,7 +1308,7 @@ def remove_path(scene, k):
 
 def _strip_stray_path_constraints(scene):
     """A Shift+D copy of a walker carries its path constraints: only real owners keep them."""
-    for ob in stage_objects(scene, roles=("char", "prop")):
+    for ob in stage_objects(scene, roles=("char", "prop")) + stage_cams(scene):
         for c in list(ob.constraints):
             if not c.name.startswith(PATH_CON + " · "):
                 continue
@@ -1288,8 +1343,8 @@ def refresh_paths(scene, edited=()):
         if not editing and (moved or rec.curve.name in edited):
             set_arrival_heading(scene, rec, i)
         time_path(scene, rec, i)
-        if _rgba_differs(rec.curve.color, rec.owner.color):
-            rec.curve.color = rec.owner.color
+        if _rgba_differs(rec.curve.color, path_color(rec.owner)):
+            rec.curve.color = path_color(rec.owner)
         cname, fname = _path_names(rec.owner, i)
         if rec.curve.name != cname and bpy.data.objects.get(cname) is None and not editing:
             rec.curve.name = cname
@@ -1340,6 +1395,10 @@ class BBST_Path(bpy.types.PropertyGroup):
     curve: bpy.props.PointerProperty(type=bpy.types.Object)
     follower: bpy.props.PointerProperty(type=bpy.types.Object)
     beat_uid: bpy.props.IntProperty(default=0)
+    face_path: bpy.props.BoolProperty(
+        name="Face along path", default=True, update=lambda self, ctx: _face_path_update(self, ctx),
+        description="Turn to face where the path goes. Off (cameras' default): keep the framing "
+                    "set on the beats while travelling the path")
 
 
 def _beat_index_update(self, context):
@@ -1747,6 +1806,7 @@ def make_stage_camera(scene, lens=35.0):
     data.lens = lens
     ob = bpy.data.objects.new(name, data)
     ob[ROLE_KEY] = "cam"
+    ob.show_name = True                 # named in the plan, like the characters
     # back from the centre (where the first character appears), stopping short of a wall;
     # each further camera one step to the side so two panes never show the same picture
     c = studio_center(scene)
@@ -2567,6 +2627,8 @@ def _path_owner(context):
         return None
     if ob.get(ROLE_KEY) in ("char", "prop"):
         return ob
+    if ob.type == 'CAMERA' and ob in stage_cams(scene):
+        return ob
     if ob.get(ROLE_KEY) == PATH_ROLE:
         rec = path_of_curve(scene, ob)
         return rec.owner if rec is not None else None
@@ -2625,7 +2687,7 @@ class BBST_OT_path_add(bpy.types.Operator):
         st = scene.bb_st
         ob = _path_owner(context)
         if ob is None:
-            self.report({'ERROR'}, "Select a character or a prop first")
+            self.report({'ERROR'}, "Select a character, a prop or a camera first")
             return {'CANCELLED'}
         if len(st.beats) < 2:
             self.report({'ERROR'}, "Add two beats first: a path shapes the move between them")
@@ -2641,6 +2703,8 @@ class BBST_OT_path_add(bpy.types.Operator):
         if path_for(scene, ob, st.beats[i].uid) is not None:
             self.report({'INFO'}, f"{ob.name} already has a path into B{i + 1}")
             return {'CANCELLED'}
+        if ob.type == 'CAMERA' and not (st.key_cameras or cam_moves(ob)):
+            set_cam_moves(scene, ob, True)      # a path is a move: the camera now moves on the beats
         create_path(scene, ob, i)
         request_sync(0.0)
         self.report({'INFO'}, f"Path for {ob.name} into B{i + 1}: Edit Path, then drag its points")
@@ -2905,6 +2969,36 @@ class BBST_OT_cam_add(bpy.types.Operator):
             st.cam0 = ob
         elif st.cam1 is None or st.cam1 == st.cam0:
             st.cam1 = ob          # the second camera pane picks up the new camera
+        request_sync(0.0)
+        return {'FINISHED'}
+
+
+class BBST_OT_cam_moves(bpy.types.Operator):
+    """Moves on beats: key this camera on every beat (move it on a beat, Save Beat; add a path for a gimbal move). Static: no keys, it stays put"""
+    bl_idname = "bbst.cam_moves"
+    bl_label = "Camera Moves on Beats"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    cam_name: bpy.props.StringProperty()
+    on: bpy.props.BoolProperty(default=True)
+
+    def invoke(self, context, event):
+        cam = bpy.data.objects.get(self.cam_name)
+        if not self.on and cam is not None and (cam.animation_data and cam.animation_data.action):
+            return context.window_manager.invoke_confirm(
+                self, event, title=f"Make {cam.name} static?",
+                message="Its beat moves and paths are removed; it stays where it is now", confirm_text="Make Static")
+        return self.execute(context)
+
+    def execute(self, context):
+        scene = context.scene
+        cam = bpy.data.objects.get(self.cam_name)
+        if cam is None or cam not in stage_cams(scene):
+            return {'CANCELLED'}
+        if not len(scene.bb_st.beats) and self.on:
+            cam[CAM_KEY] = True         # keyed from the first beat on
+            return {'FINISHED'}
+        set_cam_moves(scene, cam, self.on)
         request_sync(0.0)
         return {'FINISHED'}
 
@@ -5050,7 +5144,7 @@ class BBST_OT_export_pack(bpy.types.Operator):
                     if fc.data_path == "location" and fc.array_index in (0, 1):
                         xy[fc.array_index] = fc.evaluate(b.frame)
                 lines.append(f"- {c.name}: ({xy[0] - ox:+.2f}, {xy[1] - oy:+.2f})")
-            for walker in stage_objects(scene, roles=("char", "prop")):
+            for walker in stage_objects(scene, roles=("char", "prop")) + stage_cams(scene):
                 rec = path_for(scene, walker, b.uid) if i else None
                 if rec is not None:
                     lines.append(f"- {walker.name} walks a drawn path into this beat: "
@@ -5306,6 +5400,8 @@ def draw_path_box(lay, context):
         row.operator("bbst.path_edit", text="Edit Path", icon='EDITMODE_HLT')
         row.operator("bbst.path_reset", text="Straighten", icon='IPO_LINEAR')
         row.operator("bbst.path_remove", text="", icon='X')
+    if rec is not None and i and owner.get(ROLE_KEY) != "char":
+        col.prop(rec, "face_path")
     if rec is not None and i:
         s, e = path_window(st, i)
         secs = (e - s) / fps(scene)
@@ -5381,14 +5477,20 @@ def draw_cams(lay, context):
         sub = row.row(align=True)
         sub.ui_units_x = 3
         sub.prop(ob.data, "bbst_lens_mm", text="")     # whole millimetres, like the pane header
+        moves = scene.bb_st.key_cameras or cam_moves(ob)
+        op = row.operator("bbst.cam_moves", text="", icon='DECORATE_KEYFRAME' if moves else 'DECORATE_ANIMATE',
+                          depress=moves)
+        op.cam_name, op.on = ob.name, not moves
         row.operator("bbst.cam_bind", text="", icon='MARKER_HLT').cam_name = ob.name
         if artist:
             row.operator("bbst.playblast", text="", icon='RENDER_ANIMATION').cam_name = ob.name
         op = row.operator("bbst.obj_action", text="", icon='X')
         op.obj_name = ob.name
         op.action = 'DELETE'
-    if artist:
-        lay.prop(scene.bb_st, "key_cameras")
+    if stage_cams(scene):
+        sub = lay.row()
+        sub.enabled = False
+        sub.label(text="Key button lit: moves on beats · dim: static", icon='INFO')
 
 
 def draw_outputs(lay, context):
@@ -5705,7 +5807,7 @@ CLASSES = [
     BBST_OT_beat_add, BBST_OT_beat_save, BBST_OT_beat_goto, BBST_OT_beat_delete,
     BBST_OT_play, BBST_OT_from_start, BBST_OT_step_beat,
     BBST_OT_fit_range, BBST_UL_beats,
-    BBST_OT_cam_add, BBST_OT_cam_look, BBST_OT_cam_bind,
+    BBST_OT_cam_add, BBST_OT_cam_moves, BBST_OT_cam_look, BBST_OT_cam_bind,
     BBST_OT_pane_world, BBST_OT_pane_view, BBST_OT_pane_cam, BBST_OT_pane_lens,
     BBST_OT_lens_step, BBST_OT_pane_shading, BBST_OT_pan, BBST_OT_block, BBST_OT_block_easy,
     BBST_OT_mark_ceilings, BBST_OT_detect_floors, BBST_OT_fix_screen, BBST_OT_rebuild_shell,
