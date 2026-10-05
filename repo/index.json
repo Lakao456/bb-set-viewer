@@ -74,7 +74,7 @@
       "id": "bb_stage",
       "name": "BB Stage",
       "tagline": "Staging and blocking previs: studio, beats and cameras",
-      "version": "0.10.0",
+      "version": "0.11.0",
       "type": "add-on",
       "maintainer": "Lakao456",
       "license": [
@@ -90,9 +90,9 @@
         "Animation",
         "Camera"
       ],
-      "archive_url": "./bb_stage-0.10.0.zip",
-      "archive_size": 50190,
-      "archive_hash": "sha256:55f1ecd6adea44412ed661737df4aaeb782fc5a1c14447fce58d56b4486e1490"
+      "archive_url": "./bb_stage-0.11.0.zip",
+      "archive_size": 58136,
+      "archive_hash": "sha256:cc47a08d9c783bd0e0efd23acc2a76ff477e1c9373afd81fc024e004872efffe"
     }
   ]
 }

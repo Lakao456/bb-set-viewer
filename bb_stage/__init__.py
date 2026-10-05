@@ -22,7 +22,7 @@ from mathutils import Matrix, Quaternion, Vector
 bl_info = {
     "name": "BB Stage",
     "author": "Beta Builder",
-    "version": (0, 10, 0),
+    "version": (0, 11, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > BB Stage",
     "category": "3D View",
@@ -202,6 +202,7 @@ def migrate_staging(scene):
         if not c.hide_select:
             c.hide_select = True
     upgrade_beats(scene)
+    ensure_beat_uids(scene)
     if not st.shell_built and boundary_of(scene) is not None and layer_colls(scene, "STUDIO"):
         build_studio_shell(scene)
     for c in layer_colls(scene, "STUDIO"):
@@ -665,6 +666,7 @@ def write_beat_layout(scene, poses, start=None):
         b.frame, b.frame_out = a, d
     sync_markers(scene)
     scene.frame_end = max(layout[-1][1], layout[0][0] + 1)
+    refresh_paths(scene)        # drawn moves follow the new timing (and drop with a deleted beat)
 
 
 def relayout_beats(scene):
@@ -846,10 +848,395 @@ def beat_top_speed(scene, i):
             if fc.data_path == "location" and fc.array_index in (0, 1):
                 p0[fc.array_index] = fc.evaluate(f0)
                 p1[fc.array_index] = fc.evaluate(f1)
-        v = math.hypot(p1[0] - p0[0], p1[1] - p0[1]) / secs
+        rec = path_for(scene, ob, st.beats[i + 1].uid)
+        dist = path_length(rec) if rec is not None else math.hypot(p1[0] - p0[0], p1[1] - p0[1])
+        v = dist / secs
         if worst is None or v > worst[1]:
             worst = (ob.name, v)
     return worst
+
+
+# ------------------------------------------------------------------ paths (drawn moves)
+#
+# Aman, 5 Oct 2026: a character (or a prop) can walk a drawn Bezier path into a beat instead of
+# the straight move, e.g. Jai's single walk down the Dharavi gully. The beat poses stay the
+# truth: the path's two ends sit on them (move the character on a beat and the end follows).
+# During the move a hidden follower rides the curve; the walker copies its position and
+# heading, so the rotation follows the curve. The beat keys themselves are never touched,
+# except the arrival heading, which faces along the path.
+
+PATH_ROLE, FOLLOWER_ROLE = "path", "path_follower"
+PATH_CON = "BB Path"
+_PATH_EDITING = set()       # names of path curves in Edit Mode at the last watchdog tick
+
+
+def ensure_beat_uids(scene):
+    """Beats get a lasting id, so a path stays with its beat when earlier beats are deleted."""
+    st = scene.bb_st
+    seen = set()
+    top = max([b.uid for b in st.beats] + [st.next_uid - 1, 0])
+    for b in st.beats:
+        if b.uid <= 0 or b.uid in seen:
+            top += 1
+            b.uid = top
+        seen.add(b.uid)
+    if st.next_uid <= top:
+        st.next_uid = top + 1
+
+
+def beat_index_of(st, uid):
+    for i, b in enumerate(st.beats):
+        if b.uid == uid:
+            return i
+    return None
+
+
+def path_for(scene, ob, uid):
+    for rec in scene.bb_st.paths:
+        if ob is not None and rec.owner == ob and rec.beat_uid == uid:
+            return rec
+    return None
+
+
+def path_of_curve(scene, curve):
+    for rec in scene.bb_st.paths:
+        if curve is not None and rec.curve == curve:
+            return rec
+    return None
+
+
+def paths_coll(scene):
+    c = sub_coll(scene, "STAGE", "Paths")
+    roots = layer_colls(scene, "STAGE")
+    if c is None and roots:
+        c = bpy.data.collections.new(f"Paths · {staging_label(scene)}")
+        c[SUB_KEY] = "Paths"
+        roots[0].children.link(c)
+    return c
+
+
+def keyed_location_at(ob, frame):
+    """Where the beat keys put this object on a frame (never a frame jump: unsaved moves stay)."""
+    loc = ob.location.copy()
+    ad = ob.animation_data
+    for fc in (channelbag_fcurves(ad.action) if ad and ad.action else []):
+        if fc.data_path == "location" and 0 <= fc.array_index < 3:
+            loc[fc.array_index] = fc.evaluate(frame)
+    return loc
+
+
+def path_window(st, i):
+    """The move into beat i: from the frame beat i-1 is left to the frame beat i is reached."""
+    return beat_out(st.beats[i - 1]), st.beats[i].frame
+
+
+def _path_names(owner, i):
+    return f"Path · {owner.name} → B{i + 1}", f"Path follower · {owner.name} → B{i + 1}"
+
+
+def _con_names(uid):
+    return f"{PATH_CON} · {uid} · Loc", f"{PATH_CON} · {uid} · Rot"
+
+
+def _bez_points(rec):
+    cu = rec.curve.data if rec.curve is not None else None
+    if cu is None or not len(cu.splines) or cu.splines[0].type != 'BEZIER':
+        return None
+    return cu.splines[0].bezier_points
+
+
+def path_length(rec):
+    try:
+        return rec.curve.data.splines[0].calc_length()
+    except Exception:
+        return 0.0
+
+
+def path_world_points(rec, per_seg=12):
+    pts = _bez_points(rec)
+    if pts is None or len(pts) < 2:
+        return []
+    off = rec.curve.location.copy()
+    out = []
+    for a, b in zip(pts[:-1], pts[1:]):
+        p0, p1, p2, p3 = a.co.copy(), a.handle_right.copy(), b.handle_left.copy(), b.co.copy()
+        for k in range(per_seg):
+            t = k / per_seg
+            u = 1.0 - t
+            out.append(off + p0 * u ** 3 + p1 * (3 * u * u * t) + p2 * (3 * u * t * t) + p3 * t ** 3)
+    out.append(off + pts[-1].co)
+    return out
+
+
+def _write_keys(ob, data_path, pts, interp):
+    """Make one F-curve hold exactly these keys; True when something changed."""
+    ad = ob.animation_data
+    fc = None
+    if ad and ad.action:
+        fc = next((f for f in channelbag_fcurves(ad.action) if f.data_path == data_path), None)
+    if fc is None:
+        ob.keyframe_insert(data_path, frame=pts[0][0], group="BB Path")
+        fc = next((f for f in channelbag_fcurves(ob.animation_data.action) if f.data_path == data_path), None)
+        if fc is None:
+            return False
+    want = [(int(f), round(float(v), 5)) for f, v in pts]
+    cur = [(int(round(k.co.x)), round(k.co.y, 5)) for k in fc.keyframe_points]
+    if cur == want and all(k.interpolation == interp for k in fc.keyframe_points):
+        return False
+    while len(fc.keyframe_points):
+        fc.keyframe_points.remove(fc.keyframe_points[-1], fast=True)
+    fc.keyframe_points.add(len(want))
+    for kp, (f, v) in zip(fc.keyframe_points, want):
+        kp.co = (f, v)
+        kp.interpolation = interp
+        kp.handle_left_type = kp.handle_right_type = 'AUTO_CLAMPED'
+    fc.update()
+    return True
+
+
+def _drop_fcurves(ob, data_paths):
+    ad = ob.animation_data
+    if not (ad and ad.action):
+        return
+    for layer in ad.action.layers:
+        for strip in layer.strips:
+            for cb in strip.channelbags:
+                for fc in [f for f in cb.fcurves if f.data_path in data_paths]:
+                    cb.fcurves.remove(fc)
+
+
+def time_path(scene, rec, i):
+    """Key the walk on the beat timing: the follower goes 0 → 1 along the curve over the move
+    (a short start and stop, steady in between); the walker follows it from the frame after
+    it leaves beat i-1 until it lands on beat i, and turns into and out of the path heading."""
+    st = scene.bb_st
+    s, e = path_window(st, i)
+    span = e - s
+    loc_n, rot_n = _con_names(rec.beat_uid)
+    owner, fol = rec.owner, rec.follower
+    offset = f'constraints["{PATH_CON}"].offset_factor'
+    if span < 3:       # too quick to walk anything: the path rests, the move stays straight
+        _write_keys(fol, offset, [(s, 0.0)], 'LINEAR')
+        _write_keys(owner, f'constraints["{loc_n}"].influence', [(s, 0.0)], 'CONSTANT')
+        _write_keys(owner, f'constraints["{rot_n}"].influence', [(s, 0.0)], 'CONSTANT')
+        return
+    f = fps(scene)
+    a = max(1, min(round(0.6 * f), span // 4))
+    v = 1.0 / (span - a)
+    _write_keys(fol, offset, [(s, 0.0), (s + a, v * a / 2), (e - a, 1.0 - v * a / 2), (e, 1.0)], 'BEZIER')
+    _write_keys(owner, f'constraints["{loc_n}"].influence', [(s, 0.0), (s + 1, 1.0), (e, 0.0)], 'CONSTANT')
+    r = max(1, min(round(0.3 * f), span // 3))
+    _write_keys(owner, f'constraints["{rot_n}"].influence',
+                [(s, 0.0), (s + r, 1.0), (e - r, 1.0), (e, 0.0)], 'LINEAR')
+
+
+def fit_path(scene, rec, i):
+    """Pin the path's ends on the walker's beat poses (their handles ride along)."""
+    pts = _bez_points(rec)
+    if pts is None or len(pts) < 2:
+        return False
+    s, e = path_window(scene.bb_st, i)
+    off = rec.curve.location.copy()
+    changed = False
+    for bp, world in ((pts[0], keyed_location_at(rec.owner, s)), (pts[-1], keyed_location_at(rec.owner, e))):
+        d = (world - off) - bp.co
+        if d.length > 1e-4:
+            bp.handle_left = bp.handle_left + d
+            bp.handle_right = bp.handle_right + d
+            bp.co = bp.co + d
+            changed = True
+    return changed
+
+
+def path_heading_end(rec):
+    pts = _bez_points(rec)
+    if pts is None or len(pts) < 2:
+        return None
+    t = pts[-1].co - pts[-1].handle_left
+    if t.length < 1e-5:
+        t = pts[-1].co - pts[-2].co
+    return math.atan2(-t.x, t.y) if t.length > 1e-6 else None
+
+
+def set_arrival_heading(scene, rec, i):
+    """The walker lands on beat i facing along the end of its path."""
+    th = path_heading_end(rec)
+    ob = rec.owner
+    ad = ob.animation_data
+    fc = next((f for f in channelbag_fcurves(ad.action)
+               if f.data_path == "rotation_euler" and f.array_index == 2), None) if (ad and ad.action) else None
+    if th is None or fc is None:
+        return
+    b = scene.bb_st.beats[i]
+    cur = fc.evaluate(b.frame)
+    th = cur + ((th - cur + math.pi) % (2 * math.pi) - math.pi)      # the short way round
+    for f in sorted({b.frame, beat_out(b)}):
+        kp = next((k for k in fc.keyframe_points if abs(k.co.x - f) < 0.5), None)
+        if kp is None:
+            fc.keyframe_points.insert(f, th)
+        elif abs(kp.co.y - th) > 1e-5:
+            kp.co.y = th
+    fc.update()
+
+
+def _set_path_shape(rec, p0, mid, p1):
+    cu = rec.curve.data
+    off = rec.curve.location.copy()
+    cu.splines.clear()
+    sp = cu.splines.new('BEZIER')
+    sp.bezier_points.add(2)
+    for bp, co in zip(sp.bezier_points, (p0, mid, p1)):
+        bp.handle_left_type = bp.handle_right_type = 'AUTO'
+        bp.co = co - off
+
+
+def _start_shape(ob, p0, p1):
+    mid = (p0 + p1) / 2
+    if (p1 - p0).length < 0.6:      # no distance yet: start a loop to drag out
+        mid = mid + Matrix.Rotation(ob.rotation_euler.z, 3, 'Z') @ Vector((1.2, 0.0, 0.0))
+    return mid
+
+
+def create_path(scene, ob, i):
+    st = scene.bb_st
+    ensure_beat_uids(scene)
+    uid = st.beats[i].uid
+    coll = paths_coll(scene)
+    s, e = path_window(st, i)
+    p0, p1 = keyed_location_at(ob, s), keyed_location_at(ob, e)
+    cname, fname = _path_names(ob, i)
+    cu = bpy.data.curves.new(cname, 'CURVE')
+    cu.dimensions = '3D'
+    cu.resolution_u = 24
+    cu.twist_mode = 'Z_UP'
+    cu.use_path = True
+    cu.bevel_depth = 0.03
+    cu.bevel_resolution = 2
+    cu.materials.append(ensure_flat_material(f"BB Path · {ob.name}", tuple(ob.color)))
+    curve = bpy.data.objects.new(cname, cu)
+    curve[ROLE_KEY] = PATH_ROLE
+    curve.color = ob.color
+    curve.hide_render = True
+    curve.lock_location = (True, True, True)
+    curve.lock_rotation = (True, True, True)
+    curve.lock_scale = (True, True, True)
+    coll.objects.link(curve)
+    fol = bpy.data.objects.new(fname, None)
+    fol[ROLE_KEY] = FOLLOWER_ROLE
+    fol.empty_display_size = 0.2
+    fol.hide_render = True
+    fol.hide_select = True
+    coll.objects.link(fol)
+    fp = fol.constraints.new('FOLLOW_PATH')
+    fp.name = PATH_CON
+    fp.target = curve
+    fp.use_curve_follow = True
+    fp.use_fixed_location = True
+    fp.forward_axis = 'FORWARD_Y'
+    fp.up_axis = 'UP_Z'
+    loc_n, rot_n = _con_names(uid)
+    cl = ob.constraints.new('COPY_LOCATION')
+    cl.name = loc_n
+    cl.target = fol
+    cl.use_z = ob.get(ROLE_KEY) != "char"       # characters stay on the floor
+    cr = ob.constraints.new('COPY_ROTATION')
+    cr.name = rot_n
+    cr.target = fol
+    cr.use_x = cr.use_y = False                 # turn only: walkers stay upright
+    cl.influence = cr.influence = 0.0
+    rec = st.paths.add()
+    rec.owner, rec.curve, rec.follower, rec.beat_uid = ob, curve, fol, uid
+    _set_path_shape(rec, p0, _start_shape(ob, p0, p1), p1)
+    time_path(scene, rec, i)
+    set_arrival_heading(scene, rec, i)
+    return rec
+
+
+def remove_path(scene, k):
+    st = scene.bb_st
+    rec = st.paths[k]
+    owner, curve, fol, uid = rec.owner, rec.curve, rec.follower, rec.beat_uid
+    if owner is not None:
+        names = _con_names(uid)
+        for n in names:
+            c = owner.constraints.get(n)
+            if c is not None:
+                owner.constraints.remove(c)
+        _drop_fcurves(owner, {f'constraints["{n}"].influence' for n in names})
+    for ob in (fol, curve):
+        if ob is None:
+            continue
+        data = ob.data
+        act = ob.animation_data.action if ob.animation_data else None
+        _PATH_EDITING.discard(ob.name)
+        bpy.data.objects.remove(ob)
+        if data is not None and data.users == 0:
+            bpy.data.curves.remove(data)
+        if act is not None and act.users == 0:
+            bpy.data.actions.remove(act)
+    st.paths.remove(k)
+
+
+def _strip_stray_path_constraints(scene):
+    """A Shift+D copy of a walker carries its path constraints: only real owners keep them."""
+    for ob in stage_objects(scene, roles=("char", "prop")):
+        for c in list(ob.constraints):
+            if not c.name.startswith(PATH_CON + " · "):
+                continue
+            try:
+                uid = int(c.name.split(" · ")[1])
+            except (IndexError, ValueError):
+                continue
+            if path_for(scene, ob, uid) is None:
+                _drop_fcurves(ob, {f'constraints["{c.name}"].influence'})
+                ob.constraints.remove(c)
+
+
+def refresh_paths(scene, edited=()):
+    """Keep every path on its beats: drop the ones whose walker, curve or beat is gone, pin the
+    ends on the beat poses, re-key the timing, face the arrival along the path. Writes only
+    what changed, so it is safe to run often."""
+    if not is_staging(scene):
+        return
+    st = scene.bb_st
+    if len(st.paths):
+        ensure_beat_uids(scene)
+    for k in reversed(range(len(st.paths))):
+        rec = st.paths[k]
+        i = beat_index_of(st, rec.beat_uid)
+        alive = all(o is not None and scene.objects.get(o.name) == o
+                    for o in (rec.owner, rec.curve, rec.follower))
+        if not alive or not i:
+            remove_path(scene, k)
+            continue
+        editing = rec.curve.mode == 'EDIT'
+        moved = False if editing else fit_path(scene, rec, i)
+        if not editing and (moved or rec.curve.name in edited):
+            set_arrival_heading(scene, rec, i)
+        time_path(scene, rec, i)
+        if _rgba_differs(rec.curve.color, rec.owner.color):
+            rec.curve.color = rec.owner.color
+        cname, fname = _path_names(rec.owner, i)
+        if rec.curve.name != cname and bpy.data.objects.get(cname) is None and not editing:
+            rec.curve.name = cname
+        if rec.follower.name != fname and bpy.data.objects.get(fname) is None:
+            rec.follower.name = fname
+    _strip_stray_path_constraints(scene)
+
+
+def tick_paths(scene):
+    """Watchdog: notice a path leaving Edit Mode (Tab or Done) and settle it."""
+    edited = set()
+    for rec in scene.bb_st.paths:
+        c = rec.curve
+        if c is None:
+            continue
+        if c.mode == 'EDIT':
+            _PATH_EDITING.add(c.name)
+        elif c.name in _PATH_EDITING:
+            _PATH_EDITING.discard(c.name)
+            edited.add(c.name)
+    refresh_paths(scene, edited)
 
 
 # ------------------------------------------------------------------ properties
@@ -870,6 +1257,15 @@ class BBST_Beat(bpy.types.PropertyGroup):
                                     description="Seconds everyone stays on this beat before moving to the next")
     note: bpy.props.StringProperty(name="Note", default="")
     dirty: bpy.props.BoolProperty(default=False)   # something moved on this beat and isn't saved
+    uid: bpy.props.IntProperty(default=0)          # lasting id (paths hold on to it)
+
+
+class BBST_Path(bpy.types.PropertyGroup):
+    """One drawn move: this walker follows this curve into the beat with this id."""
+    owner: bpy.props.PointerProperty(type=bpy.types.Object)
+    curve: bpy.props.PointerProperty(type=bpy.types.Object)
+    follower: bpy.props.PointerProperty(type=bpy.types.Object)
+    beat_uid: bpy.props.IntProperty(default=0)
 
 
 def _beat_index_update(self, context):
@@ -944,6 +1340,8 @@ class BBST_Props(bpy.types.PropertyGroup):
         ('GROUND', "Ground floor", ""), ('L1', "Upper floor", ""), ('ALL', "All levels", "")],
         default='GROUND')
     beats: bpy.props.CollectionProperty(type=BBST_Beat)
+    paths: bpy.props.CollectionProperty(type=BBST_Path)
+    next_uid: bpy.props.IntProperty(default=1)
     beat_index: bpy.props.IntProperty(default=0, update=_beat_index_update)
     stage_mode: bpy.props.BoolProperty(default=False)   # the kiosk layout is active
     prev_workspace: bpy.props.StringProperty(default="")
@@ -1144,6 +1542,8 @@ def _carried_objects(scene, skip_selected=False):
     obs = set(stage_objects(scene, roles=("char", "prop", "cam"))) | set(stage_cams(scene))
     for c in layer_colls(scene, "STUDIO"):
         obs |= {o for o in coll_objects(c) if o != b}
+    for c in layer_colls(scene, "STAGE"):       # drawn paths travel with their walkers
+        obs |= {o for o in coll_objects(c) if o.get(ROLE_KEY) == PATH_ROLE}
     # stand-ins / matched pieces sit where their set object is: they never move with the studio
     out = [o for o in obs if o.parent is None and o.get(SOURCE_KEY) is None]
     if skip_selected:      # a drag that moves them along with the studio already moved them
@@ -1816,6 +2216,7 @@ class BBST_OT_obj_action(bpy.types.Operator):
                 cams = stage_cams(sc)
                 if cams:
                     sc.camera = cams[0]      # playblast and F12 need a scene camera
+            refresh_paths(sc)               # a deleted walker takes its paths along
             request_sync(0.0)
         elif self.action == 'FLOOR':
             dg = context.evaluated_depsgraph_get()
@@ -1881,6 +2282,7 @@ class BBST_OT_beat_add(bpy.types.Operator):
         _QUIET["beats"] = True
         try:
             b = st.beats.add()
+            ensure_beat_uids(scene)
             b.move_s = st.beat_spacing if len(st.beats) > 1 else 0.0
             b.hold_s = 0.0
             b.frame = b.frame_out = frame
@@ -1911,6 +2313,7 @@ class BBST_OT_beat_save(bpy.types.Operator):
         if not st.beats:
             return {'CANCELLED'}
         save_beat(scene, _clamped_beat(st))
+        refresh_paths(scene)
         return {'FINISHED'}
 
 
@@ -1970,6 +2373,246 @@ class BBST_OT_beat_delete(bpy.types.Operator):
                 _QUIET["beats"] = False
         st.beat_index = max(0, i - 1)
         sync_markers(scene)
+        return {'FINISHED'}
+
+
+# ------------------------------------------------------------------ path operators
+
+def _path_owner(context):
+    """The character or prop the Path box works on: the selection, or the walker of a selected path."""
+    scene = context.scene
+    ob = context.view_layer.objects.active if context.view_layer else None
+    if ob is None or not is_staging(scene):
+        return None
+    if ob.get(ROLE_KEY) in ("char", "prop"):
+        return ob
+    if ob.get(ROLE_KEY) == PATH_ROLE:
+        rec = path_of_curve(scene, ob)
+        return rec.owner if rec is not None else None
+    return None
+
+
+def _active_path(context):
+    """(record, beat index) of the selected walker's path into the active beat, or (None, i)."""
+    scene = context.scene
+    st = scene.bb_st
+    if not len(st.beats):
+        return None, None
+    ob = context.view_layer.objects.active
+    rec = path_of_curve(scene, ob) if ob is not None and ob.get(ROLE_KEY) == PATH_ROLE else None
+    if rec is not None:
+        return rec, beat_index_of(st, rec.beat_uid)
+    i = _clamped_beat(st)
+    owner = _path_owner(context)
+    return (path_for(scene, owner, st.beats[i].uid) if (owner is not None and i) else None), i
+
+
+def _work_override(context):
+    win = context.window
+    area = stage_panes(win).get("WORK") if win is not None else None
+    area = area or view3d_area(context)
+    region = next((r for r in area.regions if r.type == 'WINDOW'), None) if area is not None else None
+    if area is None or region is None:
+        return None
+    return dict(window=win, screen=win.screen, area=area, region=region)
+
+
+def _finish_path_edit(context, rec):
+    """Leave Edit Mode on a path and settle it: ends back on the beats, arrival heading, timing."""
+    scene = context.scene
+    ov = _work_override(context)
+    if rec.curve is not None and rec.curve.mode == 'EDIT' and ov is not None:
+        with context.temp_override(**ov):
+            bpy.ops.object.mode_set(mode='OBJECT')
+    i = beat_index_of(scene.bb_st, rec.beat_uid)
+    if i:
+        fit_path(scene, rec, i)
+        set_arrival_heading(scene, rec, i)
+        time_path(scene, rec, i)
+    if rec.curve is not None:
+        _PATH_EDITING.discard(rec.curve.name)
+
+
+class BBST_OT_path_add(bpy.types.Operator):
+    """Draw a path for this character's (or prop's) move into the active beat: they walk it instead of a straight line, facing along it"""
+    bl_idname = "bbst.path_add"
+    bl_label = "Add Path"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        st = scene.bb_st
+        ob = _path_owner(context)
+        if ob is None:
+            self.report({'ERROR'}, "Select a character or a prop first")
+            return {'CANCELLED'}
+        if len(st.beats) < 2:
+            self.report({'ERROR'}, "Add two beats first: a path shapes the move between them")
+            return {'CANCELLED'}
+        i = _clamped_beat(st)
+        if i == 0:
+            self.report({'ERROR'}, "A path shapes the move into a beat: pick B2 or later")
+            return {'CANCELLED'}
+        cur = beat_at_frame(scene)
+        if cur is not None and st.beats[cur].dirty:
+            save_beat(scene, cur)
+        ensure_beat_uids(scene)
+        if path_for(scene, ob, st.beats[i].uid) is not None:
+            self.report({'INFO'}, f"{ob.name} already has a path into B{i + 1}")
+            return {'CANCELLED'}
+        create_path(scene, ob, i)
+        request_sync(0.0)
+        self.report({'INFO'}, f"Path for {ob.name} into B{i + 1}: Edit Path, then drag its points")
+        return {'FINISHED'}
+
+
+class BBST_OT_path_edit(bpy.types.Operator):
+    """Shape this path: drag its points and handles in the plan (the two ends stay on the beats)"""
+    bl_idname = "bbst.path_edit"
+    bl_label = "Edit Path"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        rec, _i = _active_path(context)
+        ov = _work_override(context)
+        if rec is None or rec.curve is None or ov is None:
+            self.report({'ERROR'}, "No path here yet: Add Path first")
+            return {'CANCELLED'}
+        vl = context.view_layer
+        with context.temp_override(**ov):
+            act = vl.objects.active
+            if act is not None and act.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            for o in list(vl.objects.selected):
+                o.select_set(False)
+            rec.curve.select_set(True)
+            vl.objects.active = rec.curve
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.curve.select_all(action='DESELECT')
+            try:
+                bpy.ops.wm.tool_set_by_id(name="builtin.select")     # drag a point to move it
+            except Exception:
+                pass
+        _PATH_EDITING.add(rec.curve.name)
+        return {'FINISHED'}
+
+
+class BBST_OT_path_done(bpy.types.Operator):
+    """Finish shaping the path"""
+    bl_idname = "bbst.path_done"
+    bl_label = "Done"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        rec, _i = _active_path(context)
+        if rec is None:
+            ob = context.view_layer.objects.active
+            if ob is not None and ob.mode == 'EDIT':
+                ov = _work_override(context)
+                if ov is not None:
+                    with context.temp_override(**ov):
+                        bpy.ops.object.mode_set(mode='OBJECT')
+            return {'FINISHED'}
+        _finish_path_edit(context, rec)
+        if rec.owner is not None:
+            _select_only(context, rec.owner)
+        for w in stage_windows():
+            apply_mode_tool(w)
+        request_sync(0.0)
+        return {'FINISHED'}
+
+
+class BBST_OT_path_point(bpy.types.Operator):
+    """Add: a new point in the middle of the longest stretch (or between the two points you picked). Delete: the middle points you picked"""
+    bl_idname = "bbst.path_point"
+    bl_label = "Path Point"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    action: bpy.props.EnumProperty(items=[('ADD', "Add", ""), ('DELETE', "Delete", "")])
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.view_layer.objects.active if context.view_layer else None
+        return ob is not None and ob.get(ROLE_KEY) == PATH_ROLE and ob.mode == 'EDIT'
+
+    def execute(self, context):
+        ob = context.view_layer.objects.active
+        ov = _work_override(context)
+        if ov is None or not len(ob.data.splines):
+            return {'CANCELLED'}
+        pts = ob.data.splines[0].bezier_points
+        n = len(pts)
+        if self.action == 'ADD':
+            sel = [k for k, bp in enumerate(pts) if bp.select_control_point]
+            if len(sel) == 2 and sel[1] - sel[0] == 1:
+                pair = sel
+            else:
+                lens = [(pts[k + 1].co - pts[k].co).length for k in range(n - 1)]
+                k = max(range(n - 1), key=lambda j: lens[j])
+                pair = [k, k + 1]
+            for k, bp in enumerate(pts):
+                on = k in pair
+                bp.select_control_point = bp.select_left_handle = bp.select_right_handle = on
+            with context.temp_override(**ov):
+                bpy.ops.curve.subdivide(number_cuts=1)
+            pts = ob.data.splines[0].bezier_points
+            for k, bp in enumerate(pts):
+                on = k == pair[0] + 1
+                bp.select_control_point = bp.select_left_handle = bp.select_right_handle = on
+        else:
+            doomed = [k for k, bp in enumerate(pts) if bp.select_control_point and 0 < k < n - 1]
+            if not doomed:
+                self.report({'ERROR'}, "Click a middle point first (the two ends stay on the beats)")
+                return {'CANCELLED'}
+            for k, bp in enumerate(pts):
+                on = k in doomed
+                bp.select_control_point = bp.select_left_handle = bp.select_right_handle = on
+            with context.temp_override(**ov):
+                bpy.ops.curve.delete(type='VERT')
+        return {'FINISHED'}
+
+
+class BBST_OT_path_reset(bpy.types.Operator):
+    """Straighten this path again: start, middle, end"""
+    bl_idname = "bbst.path_reset"
+    bl_label = "Straighten Path"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        rec, i = _active_path(context)
+        if rec is None or not i:
+            return {'CANCELLED'}
+        _finish_path_edit(context, rec)
+        s, e = path_window(scene.bb_st, i)
+        p0, p1 = keyed_location_at(rec.owner, s), keyed_location_at(rec.owner, e)
+        _set_path_shape(rec, p0, _start_shape(rec.owner, p0, p1), p1)
+        set_arrival_heading(scene, rec, i)
+        time_path(scene, rec, i)
+        return {'FINISHED'}
+
+
+class BBST_OT_path_remove(bpy.types.Operator):
+    """Remove this path: the move into the beat goes back to a straight line"""
+    bl_idname = "bbst.path_remove"
+    bl_label = "Remove Path"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        rec, _i = _active_path(context)
+        if rec is None:
+            return {'CANCELLED'}
+        owner = rec.owner
+        if rec.curve is not None and rec.curve.mode == 'EDIT':
+            _finish_path_edit(context, rec)
+        k = next(j for j, r in enumerate(scene.bb_st.paths) if r == rec)
+        remove_path(scene, k)
+        if owner is not None:
+            _select_only(context, owner)
+        for w in stage_windows():
+            apply_mode_tool(w)
+        request_sync(0.0)
         return {'FINISHED'}
 
 
@@ -2249,7 +2892,7 @@ def _declutter(space, names=True, sidebar=False):
 
 def visibility_plan(scene):
     """Which objects belong to which world of this staging (names; computed fresh)."""
-    sett, studio, boundary, cams, stage = set(), set(), set(), set(), set()
+    sett, studio, boundary, cams, stage, paths = set(), set(), set(), set(), set(), set()
     for c in layer_colls(scene, "SET"):
         for ob in coll_objects(c):
             if ob.type in SET_TYPES or (ob.type == 'EMPTY' and ob.instance_type == 'COLLECTION'):
@@ -2259,14 +2902,20 @@ def visibility_plan(scene):
             (boundary if ob.get(ROLE_KEY) == "boundary" else studio).add(ob.name)
     for c in layer_colls(scene, "STAGE"):
         for ob in coll_objects(c):
+            role = ob.get(ROLE_KEY)
+            if role == FOLLOWER_ROLE:
+                continue                # rides the path unseen
+            if role == PATH_ROLE:
+                paths.add(ob.name)      # drawn in the plan only, never in a camera
+                continue
             (cams if ob.type == 'CAMERA' else stage).add(ob.name)
-    return dict(set=sett, studio=studio, boundary=boundary, cams=cams, stage=stage)
+    return dict(set=sett, studio=studio, boundary=boundary, cams=cams, stage=stage, paths=paths)
 
 
 def desired_names(plan, role, world):
     names = set(plan["stage"])
     if role == "WORK":
-        names |= plan["cams"] | plan["boundary"]
+        names |= plan["cams"] | plan["boundary"] | plan.get("paths", set())
     if world in ('STUDIO', 'GHOST'):
         names |= plan["studio"]
     if world in ('SET', 'GHOST'):
@@ -3173,13 +3822,81 @@ def _build_stage_screen(scene_name):
 
 AX_COL = {'X': (0.96, 0.22, 0.32), 'Y': (0.55, 0.86, 0.0), 'Z': (0.17, 0.56, 1.0)}
 _RING_AXES = {"char": "Z", "piece": "Z", "cam": "Z", "prop": "XYZ"}
-_PLANES = {"char": ("XY",), "piece": ("XY",), "cam": ("XY", "XZ", "YZ"), "prop": ("XY", "XZ", "YZ")}
+# no floor square: a click-drag already moves things along the floor (Aman, 5 Oct 2026); props and
+# cameras keep the two upright squares, the only way to lift them from the plan's camera panes
+_PLANES = {"char": (), "piece": (), "cam": ("XZ", "YZ"), "prop": ("XZ", "YZ")}
 _PLANE_AXES = {"XY": (True, True, False), "XZ": (True, False, True), "YZ": (False, True, True)}
 _PLANE_COL = {"XY": 'Z', "XZ": 'Y', "YZ": 'X'}       # coloured like the axis it does not move along
 _RESIZE = {'E': (1, 0), 'W': (-1, 0), 'N': (0, 1), 'S': (0, -1),
            'NE': (1, 1), 'NW': (-1, 1), 'SE': (1, -1), 'SW': (-1, -1)}
 _SPACE_COL = (1.0, 0.78, 0.15)
 _HANDLES = {}       # region pointer -> its handles group (read by the GUI tests)
+RING_MIN_PX = 30    # a turn ring never shrinks below this on screen (at 1x UI scale)
+
+
+def _turn_ring_tris():
+    """A turn ring in unit radius: two arcs, each ending in an arrowhead pointing the same way
+    round, so it reads as 'turn' at a glance."""
+    tris = []
+    r0, r1 = 0.86, 1.0
+
+    def p(r, a):
+        return (r * math.cos(a), r * math.sin(a), 0.0)
+    for a0, a1 in ((math.radians(28), math.radians(150)), (math.radians(208), math.radians(330))):
+        n = 16
+        for k in range(n):
+            t0 = a0 + (a1 - a0) * k / n
+            t1 = a0 + (a1 - a0) * (k + 1) / n
+            tris += [p(r0, t0), p(r1, t0), p(r1, t1), p(r0, t0), p(r1, t1), p(r0, t1)]
+        tip = a1 + math.radians(22)
+        tris += [p(0.74, a1), p(1.12, a1), p(0.93, tip)]
+    return tris
+
+
+def _ring_select_tris():
+    tris = []
+    r0, r1, n = 0.7, 1.18, 48
+    for k in range(n):
+        t0, t1 = 2 * math.pi * k / n, 2 * math.pi * (k + 1) / n
+        a = [(r0 * math.cos(t0), r0 * math.sin(t0), 0.0), (r1 * math.cos(t0), r1 * math.sin(t0), 0.0),
+             (r1 * math.cos(t1), r1 * math.sin(t1), 0.0), (r0 * math.cos(t1), r0 * math.sin(t1), 0.0)]
+        tris += [a[0], a[1], a[2], a[0], a[2], a[3]]
+    return tris
+
+
+class BBST_GT_turn(bpy.types.Gizmo):
+    """Turn ring with arrows; clicking it runs the rotate its group gives it."""
+    bl_idname = "BBST_GT_turn"
+
+    def setup(self):
+        if not hasattr(self, "shape"):
+            self.shape = self.new_custom_shape('TRIS', _turn_ring_tris())
+            self.shape_select = self.new_custom_shape('TRIS', _ring_select_tris())
+
+    def draw(self, context):
+        self.draw_custom_shape(self.shape)
+
+    def draw_select(self, context, select_id):
+        self.draw_custom_shape(self.shape_select, select_id=select_id)
+
+
+def _px_per_m(region, r3d, p):
+    from bpy_extras.view3d_utils import location_3d_to_region_2d
+    if region is None or r3d is None:
+        return None
+    a = location_3d_to_region_2d(region, r3d, p)
+    b = location_3d_to_region_2d(region, r3d, p + r3d.view_rotation @ Vector((1.0, 0.0, 0.0)))
+    return (b - a).length if (a is not None and b is not None) else None
+
+
+def ring_radius(ob, kind):
+    """Just outside what it turns: a character's base disc, a prop's or piece's footprint."""
+    if kind == "char":
+        return 0.46
+    if kind == "cam":
+        return 0.4
+    d = ob.dimensions
+    return max(0.3, min(3.0, max(d.x, d.y) / 2 + 0.12))
 
 
 def handles_on():
@@ -3254,16 +3971,14 @@ class BBST_GGT_handles(bpy.types.GizmoGroup):
     def setup(self, context):
         self.rings, self.planes, self.resize = {}, {}, {}
         for ax in "XYZ":
-            gz = self.gizmos.new("GIZMO_GT_dial_3d")
+            gz = self.gizmos.new(BBST_GT_turn.bl_idname)
             op = gz.target_set_operator("transform.rotate")
             op.orient_axis = ax
             op.orient_type = 'GLOBAL'
             op.constraint_axis = (ax == 'X', ax == 'Y', ax == 'Z')
             op.release_confirm = True
-            gz.draw_options = set() if ax == 'Z' else {'CLIP'}
-            gz.line_width = 3.0
-            gz.scale_basis = 1.0
-            _style(gz, AX_COL[ax])
+            _style(gz, AX_COL[ax], 0.9)
+            gz.use_draw_scale = False        # sized in metres around what it turns (see _place)
             self.rings[ax] = gz
         for pl, axes in _PLANE_AXES.items():
             gz = self.gizmos.new("GIZMO_GT_primitive_3d")
@@ -3321,10 +4036,16 @@ class BBST_GGT_handles(bpy.types.GizmoGroup):
             if kind == "space":
                 self._place_space(scene)
                 return
-            base = Matrix.Translation(ob.matrix_world.translation)
+            loc = ob.matrix_world.translation
+            base = Matrix.Translation(loc)
+            rad = ring_radius(ob, kind)
+            ppm = _px_per_m(context.region, context.region_data, loc)
+            if ppm:
+                prefs = context.preferences
+                rad = max(rad, RING_MIN_PX * prefs.view.ui_scale * prefs.system.pixel_size / ppm)
             for ax in _RING_AXES[kind]:
                 gz = self.rings[ax]
-                gz.matrix_basis = base @ _axis_matrix(ax)
+                gz.matrix_basis = base @ _axis_matrix(ax) @ Matrix.Scale(rad, 4)
                 gz.hide = False
             for pl in _PLANES[kind]:
                 gz = self.planes[pl]
@@ -3563,6 +4284,10 @@ def _bbst_watchdog():
                         request_sync(0.0)
                 except Exception as e:
                     print("BB Stage studio shape:", e)
+                try:
+                    tick_paths(win.scene)
+                except Exception as e:
+                    print("BB Stage paths:", e)
             sig = _window_signature(win)
             old = _WATCH.get(key)
             if old == sig:
@@ -4104,6 +4829,11 @@ class BBST_OT_export_pack(bpy.types.Operator):
                     if fc.data_path == "location" and fc.array_index in (0, 1):
                         xy[fc.array_index] = fc.evaluate(b.frame)
                 lines.append(f"- {c.name}: ({xy[0] - ox:+.2f}, {xy[1] - oy:+.2f})")
+            for walker in stage_objects(scene, roles=("char", "prop")):
+                rec = path_for(scene, walker, b.uid) if i else None
+                if rec is not None:
+                    lines.append(f"- {walker.name} walks a drawn path into this beat: "
+                                 f"{path_length(rec):.1f} m in {b.move_s:.1f} s (see the top map)")
             lines.append("")
         open(os.path.join(d, "Beat Sheet.md"), "w", encoding="utf-8").write("\n".join(lines))
 
@@ -4162,7 +4892,13 @@ def build_beat_trails(scene):
             if fc.data_path == "location" and fc.array_index in (0, 1):
                 for f in frames:
                     xy[f][fc.array_index] = fc.evaluate(f)
-        pts = [Vector((xy[f][0], xy[f][1], st.floor_z + 0.05)) for f in frames]
+        beat_pts = [Vector((xy[f][0], xy[f][1], st.floor_z + 0.05)) for f in frames]
+        pts = []
+        for k, v in enumerate(beat_pts):
+            rec = path_for(scene, ob, st.beats[k].uid) if k else None
+            if rec is not None:         # a drawn walk: the trail follows it
+                pts += [Vector((q.x, q.y, st.floor_z + 0.05)) for q in path_world_points(rec)[1:-1]]
+            pts.append(v)
         cu = bpy.data.curves.new(f"TRAIL {ob.name}", 'CURVE')
         cu.dimensions = '3D'
         cu.bevel_depth = 0.035
@@ -4174,7 +4910,7 @@ def build_beat_trails(scene):
         tr.color = ob.color
         stage[0].objects.link(tr)
         made.append(tr)
-        for k, v in enumerate(pts):   # a flat dot on every beat
+        for k, v in enumerate(beat_pts):   # a flat dot on every beat
             bm = bmesh.new()
             bmesh.ops.create_cone(bm, cap_ends=True, segments=12, radius1=1, radius2=1, depth=1,
                                   matrix=Matrix.Translation(v) @ Matrix.Diagonal((0.11, 0.11, 0.008)).to_4x4())
@@ -4306,6 +5042,54 @@ def draw_cast(lay, context):
             lay.template_list("BBST_UL_objects", "props", props_c, "objects", st, "prop_index", rows=2)
 
 
+def draw_path_box(lay, context):
+    """Under the active beat: the selected character's (or prop's) drawn path into it."""
+    scene = context.scene
+    st = scene.bb_st
+    owner = _path_owner(context)
+    if owner is None or not len(st.beats):
+        return
+    rec, i = _active_path(context)
+    box = lay.box()
+    col = box.column(align=True)
+    col.label(text=f"Path · {owner.name}", icon='CURVE_BEZCURVE')
+    if len(st.beats) < 2 or not i:
+        col.label(text="Pick B2 or later: a path shapes the walk into that beat", icon='INFO')
+    elif rec is None:
+        r = col.row()
+        r.scale_y = 1.2
+        r.operator("bbst.path_add", text=f"Add Path into B{i + 1}", icon='ADD')
+    elif rec.curve is not None and rec.curve.mode == 'EDIT':
+        col.label(text="Drag points · ends stay on beats", icon='INFO')
+        row = col.row(align=True)
+        row.operator("bbst.path_point", text="Add Point", icon='ADD').action = 'ADD'
+        row.operator("bbst.path_point", text="Delete Point", icon='REMOVE').action = 'DELETE'
+        r = col.row()
+        r.scale_y = 1.3
+        r.operator("bbst.path_done", text="Done", icon='CHECKMARK')
+    else:
+        row = col.row(align=True)
+        row.operator("bbst.path_edit", text="Edit Path", icon='EDITMODE_HLT')
+        row.operator("bbst.path_reset", text="Straighten", icon='IPO_LINEAR')
+        row.operator("bbst.path_remove", text="", icon='X')
+    if rec is not None and i:
+        s, e = path_window(st, i)
+        secs = (e - s) / fps(scene)
+        length = path_length(rec)
+        speed = length / secs if secs > 0 else 0.0
+        col.label(text=f"{length:.1f} m in {secs:.1f} s · {speed:.1f} m/s",
+                  icon='ERROR' if (owner.get(ROLE_KEY) == "char" and speed > 1.6) else 'TIME')
+    mine = sorted(((beat_index_of(st, r.beat_uid), r) for r in st.paths if r.owner == owner),
+                  key=lambda x: -1 if x[0] is None else x[0])
+    others = [(k, r) for k, r in mine if k and k != i]
+    if others:
+        col.separator()
+        for k, r in others:
+            row = col.row(align=True)
+            row.label(text=f"Path into B{k + 1} · {path_length(r):.1f} m", icon='CURVE_PATH')
+            row.operator("bbst.beat_goto", text="", icon='FORWARD').index = k
+
+
 def draw_beats(lay, context):
     scene = context.scene
     st = scene.bb_st
@@ -4340,6 +5124,7 @@ def draw_beats(lay, context):
         row = lay.row(align=True)
         row.operator("bbst.beat_delete", icon='X')
         row.operator("bbst.fit_range", icon='PREVIEW_RANGE')
+        draw_path_box(lay, context)
         if n > 1:
             total = (beat_out(st.beats[-1]) - st.beats[0].frame) / fps(scene)
             warn = "" if 4 <= total <= 30 else "  (outside Seedance 4–30 s)"
@@ -4672,7 +5457,7 @@ PANEL_CLASSES = [
 ]
 
 CLASSES = [
-    BBST_Beat, BBST_Props,
+    BBST_Beat, BBST_Path, BBST_Props,
     BBST_OT_new_staging, BBST_OT_goto_scene, BBST_OT_delete_staging,
     BBST_OT_add_kit,
     BBST_OT_pick_standin, BBST_OT_pick_match,
@@ -4687,7 +5472,9 @@ CLASSES = [
     BBST_OT_pane_cam_pick, BBST_OT_pane_level,
     BBST_OT_enter_stage, BBST_OT_exit_stage, BBST_OT_place_space, BBST_OT_walk,
     BBST_OT_playblast, BBST_OT_export_pack, BBST_OT_top_map,
-    BBST_OT_studio_resize, BBST_GGT_handles,
+    BBST_OT_studio_resize, BBST_GT_turn, BBST_GGT_handles,
+    BBST_OT_path_add, BBST_OT_path_edit, BBST_OT_path_done, BBST_OT_path_point,
+    BBST_OT_path_reset, BBST_OT_path_remove,
 ] + PANEL_CLASSES
 
 PROP_CLONES = []
