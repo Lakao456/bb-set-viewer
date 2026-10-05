@@ -22,7 +22,7 @@ from mathutils import Matrix, Quaternion, Vector
 bl_info = {
     "name": "BB Stage",
     "author": "Beta Builder",
-    "version": (0, 13, 0),
+    "version": (0, 13, 1),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > BB Stage",
     "category": "3D View",
@@ -279,8 +279,8 @@ def migrate_staging(scene):
     upgrade_beats(scene)
     ensure_beat_uids(scene)
     for cam in stage_cams(scene):
-        if not cam.show_name:
-            cam.show_name = True
+        if cam.show_name:
+            cam.show_name = False       # the plan draws its own camera tags (camera labels)
         if st.key_cameras and not cam.get(CAM_KEY):
             cam[CAM_KEY] = True         # the old "Key cameras on beats" switch, per camera now
     if st.key_cameras:
@@ -1806,7 +1806,6 @@ def make_stage_camera(scene, lens=35.0):
     data.lens = lens
     ob = bpy.data.objects.new(name, data)
     ob[ROLE_KEY] = "cam"
-    ob.show_name = True                 # named in the plan, like the characters
     # back from the centre (where the first character appears), stopping short of a wall;
     # each further camera one step to the side so two panes never show the same picture
     c = studio_center(scene)
@@ -5791,6 +5790,102 @@ def _cleanup_legacy_panel_hides():
             continue
 
 
+# ------------------------------------------------------------------ camera labels in the plan
+#
+# Aman, 5 Oct 2026: "put names on the cameras... it is hard to understand which camera we are
+# playing with". Blender's own name text is dim and vanishes with the camera above the plan
+# cut, so the plan draws its own tag: name, which camera pane shows it, a dot where it stands
+# and a tick where it looks — at any height.
+
+_CAM_DRAW_KEY = "bbst_cam_labels"
+
+
+def _draw_cam_labels():
+    ctx = bpy.context
+    try:
+        win, area, region, rv3d = ctx.window, ctx.area, ctx.region, ctx.region_data
+        if win is None or area is None or region is None or rv3d is None or not _in_stage(ctx):
+            return
+        roles = stage_panes(win)
+        if roles.get("WORK") != area:
+            return
+        scene = ctx.scene
+        cams = stage_cams(scene)
+        if not cams:
+            return
+        import blf
+        import gpu
+        from gpu_extras.batch import batch_for_shader
+        from bpy_extras.view3d_utils import location_3d_to_region_2d
+        shown = {}
+        for role in sorted(r for r in roles if r.startswith("CAM")):
+            cam = pane_camera(scene, role)
+            if cam is not None:
+                shown.setdefault(cam.name, []).append("top pane" if role == "CAM0" else "bottom pane")
+        ui = ctx.preferences.view.ui_scale * ctx.preferences.system.pixel_size
+        font = 0
+        blf.size(font, 11 * ui)
+        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        gpu.state.blend_set('ALPHA')
+        amber = (1.0, 0.72, 0.15, 1.0)
+        for cam in cams:
+            if cam.hide_get() or cam.hide_viewport:
+                continue
+            mw = cam.matrix_world
+            p = location_3d_to_region_2d(region, rv3d, mw.translation)
+            if p is None:
+                continue
+            fwd = mw.to_3x3() @ Vector((0.0, 0.0, -1.0))
+            q = location_3d_to_region_2d(region, rv3d, mw.translation + Vector((fwd.x, fwd.y, 0.0)).normalized()
+                                         if Vector((fwd.x, fwd.y)).length > 1e-4 else mw.translation)
+            r = 4 * ui
+            dot = [(p.x - r, p.y - r), (p.x + r, p.y - r), (p.x + r, p.y + r),
+                   (p.x - r, p.y - r), (p.x + r, p.y + r), (p.x - r, p.y + r)]
+            shader.uniform_float("color", amber)
+            batch_for_shader(shader, 'TRIS', {"pos": dot}).draw(shader)
+            if q is not None and (q - p).length > 1:      # an arrowhead where it looks
+                d = (q - p).normalized()
+                n = Vector((-d.y, d.x))
+                tip, base = p + d * 26 * ui, p + d * 12 * ui
+                arrow = [(tip.x, tip.y), (base.x + n.x * 6 * ui, base.y + n.y * 6 * ui),
+                         (base.x - n.x * 6 * ui, base.y - n.y * 6 * ui)]
+                batch_for_shader(shader, 'TRIS', {"pos": arrow}).draw(shader)
+            text = cam.name + (f"  · {' + '.join(shown[cam.name])}" if cam.name in shown else "")
+            if cam.get(CAM_KEY):
+                text += "  · moves"
+            w, h = blf.dimensions(font, text)
+            x, y = p.x + 9 * ui, p.y + 7 * ui
+            pad = 4 * ui
+            box = [(x - pad, y - pad), (x + w + pad, y - pad), (x + w + pad, y + h + pad),
+                   (x - pad, y - pad), (x + w + pad, y + h + pad), (x - pad, y + h + pad)]
+            shader.uniform_float("color", (0.06, 0.06, 0.07, 0.78))
+            batch_for_shader(shader, 'TRIS', {"pos": box}).draw(shader)
+            blf.color(font, *amber)
+            blf.position(font, x, y, 0)
+            blf.draw(font, text)
+        gpu.state.blend_set('NONE')
+    except Exception as e:
+        if not _SYNC.get("label_error"):
+            _SYNC["label_error"] = True
+            print("BB Stage camera labels:", e)
+
+
+def _add_cam_labels():
+    _remove_cam_labels()
+    h = bpy.types.SpaceView3D.draw_handler_add(_draw_cam_labels, (), 'WINDOW', 'POST_PIXEL')
+    bpy.app.driver_namespace[_CAM_DRAW_KEY] = h
+
+
+def _remove_cam_labels():
+    h = bpy.app.driver_namespace.get(_CAM_DRAW_KEY)
+    if h is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(h, 'WINDOW')
+        except (ValueError, RuntimeError):
+            pass
+        bpy.app.driver_namespace[_CAM_DRAW_KEY] = None
+
+
 # ------------------------------------------------------------------ register
 
 PANEL_CLASSES = [
@@ -5892,6 +5987,7 @@ def register():
     _remove_keymaps()
     _add_keymaps()
     _stop_timers()
+    _add_cam_labels()
     bpy.app.timers.register(_bbst_watchdog, first_interval=1.0, persistent=True)
     bpy.app.driver_namespace[_TIMERS_KEY] = [_bbst_watchdog]
     bpy.app.timers.register(_bbst_after_load, first_interval=0.5)
@@ -5899,6 +5995,7 @@ def register():
 
 def unregister():
     _stop_timers()
+    _remove_cam_labels()
     _remove_keymaps()
     _remove_named_handlers()
     _release_headers()
