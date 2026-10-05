@@ -22,7 +22,7 @@ from mathutils import Matrix, Quaternion, Vector
 bl_info = {
     "name": "BB Stage",
     "author": "Beta Builder",
-    "version": (0, 9, 0),
+    "version": (0, 9, 1),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > BB Stage",
     "category": "3D View",
@@ -1919,11 +1919,11 @@ class BBST_UL_beats(bpy.types.UIList):
                           icon='STRIP_COLOR_02' if b.dirty else 'DECORATE_KEYFRAME')
         op.index = index
         tag = row.row(align=True)
-        tag.ui_units_x = 1.4
+        tag.ui_units_x = 1.3
         tag.label(text=f"B{index + 1}")
         row.prop(b, "label", text="", emboss=False, placeholder="beat name")
         nums = row.row(align=True)
-        nums.ui_units_x = 5.6
+        nums.ui_units_x = 7.2
         mv = nums.row(align=True)
         mv.enabled = index > 0                      # the first beat has nothing to move from
         mv.prop(b, "move_s", text="")
@@ -3870,7 +3870,7 @@ def draw_beats(lay, context):
         hdr = lay.row(align=True)
         hdr.label(text="      Beat")
         cols = hdr.row(align=True)
-        cols.ui_units_x = 5.6
+        cols.ui_units_x = 7.2
         cols.alignment = 'RIGHT'
         cols.label(text="Move s")
         cols.label(text="Hold s")
