@@ -22,7 +22,7 @@ from mathutils import Matrix, Quaternion, Vector
 bl_info = {
     "name": "BB Stage",
     "author": "Beta Builder",
-    "version": (0, 9, 1),
+    "version": (0, 10, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > BB Stage",
     "category": "3D View",
@@ -77,7 +77,8 @@ HOME_KEY = "bb_st_home"            # set object moved into a level collection: w
 TINT_KEY = "bb_st_c0"              # ghost tint: the object's own colour, restored before saving
 DATA_VERSION = 8
 EYE_HEIGHT = 1.6
-_QUIET = {"floor": False, "beats": False}     # True while an upgrade sets play_level
+_QUIET = {"floor": False, "beats": False,     # floor: True while an upgrade sets play_level
+          "dims": False, "carry": False}      # dims: a resize sets width and depth together
 WORLD_ITEMS = [('STUDIO', "Studio", "The grey studio blockout"),
                ('SET', "Set", "The finished 3D location"),
                ('GHOST', "Ghost", "Studio solid, the set faded behind it")]
@@ -203,6 +204,10 @@ def migrate_staging(scene):
     upgrade_beats(scene)
     if not st.shell_built and boundary_of(scene) is not None and layer_colls(scene, "STUDIO"):
         build_studio_shell(scene)
+    for c in layer_colls(scene, "STUDIO"):
+        for ob in coll_objects(c):
+            if is_studio_floor(ob) and not all(ob.lock_location):
+                lock_floor(ob)
     if st.data_version < DATA_VERSION:
         _QUIET["floor"] = True          # an upgrade must not re-detect the floor and move things
         try:
@@ -493,14 +498,38 @@ def _shell_update(self, context):
 
 def _studio_dims_update(self, context):
     scene = self.id_data if isinstance(getattr(self, "id_data", None), bpy.types.Scene) else context.scene
-    if not is_staging(scene):
+    if is_staging(scene) and not _QUIET["dims"]:
+        rebuild_studio(scene)
+
+
+def resize_studio(scene, w, d, cx, cy, shell=True):
+    """New width/depth and centre in one step (a resize handle keeps the opposite side put).
+    What stands in the studio stays where it is: this is not a move. shell=False (while a
+    handle is dragged) reshapes only the wire box; the floor and walls follow on release."""
+    st = scene.bb_st
+    b = boundary_of(scene)
+    if b is None:
         return
+    _QUIET["dims"] = True
+    try:
+        st.studio_w = min(60.0, max(2.0, w))
+        st.studio_d = min(60.0, max(2.0, d))
+    finally:
+        _QUIET["dims"] = False
+    b.location.x, b.location.y = cx, cy
+    st.bound_xy = (cx, cy)
+    st.bound_xy_set = True
+    rebuild_studio(scene, shell)
+
+
+def rebuild_studio(scene, shell=True):
     st = scene.bb_st
     studio = layer_colls(scene, "STUDIO")
     if not studio:
         return
     old = boundary_of(scene)
     loc = old.location.copy() if old is not None else None
+    rot_z = old.rotation_euler.z if old is not None else 0.0
     new = build_boundary_object(staging_label(scene), st.studio_w, st.studio_d, st.studio_h)
     if old is not None and old != new:
         bpy.data.objects.remove(old)
@@ -508,9 +537,11 @@ def _studio_dims_update(self, context):
         studio[0].objects.link(new)
     if loc is not None:
         new.location = loc
+    new.rotation_euler.z = rot_z
     st.boundary = new
-    build_studio_shell(scene)
-    request_sync()
+    if shell:
+        build_studio_shell(scene)
+        request_sync()
 
 
 # ------------------------------------------------------------------ beats
@@ -695,8 +726,63 @@ def beat_at_frame(scene, frame=None):
     return None
 
 
+def follow_studio_space(scene):
+    """However the studio space moves (a handle, a drag, G, Place Studio Space), everything
+    standing in it moves with it, live (Aman, 5 Oct 2026). Width/depth changes are not moves:
+    resize_studio records the new centre itself."""
+    if _QUIET["carry"]:
+        return
+    b = boundary_of(scene)
+    if b is None:
+        return
+    st = scene.bb_st
+    x, y = b.location.x, b.location.y
+    if not st.bound_xy_set:
+        st.bound_xy = (x, y)
+        st.bound_xy_set = True
+        return
+    dx, dy = x - st.bound_xy[0], y - st.bound_xy[1]
+    if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+        return
+    _QUIET["carry"] = True
+    try:
+        carry_with_studio(scene, Vector((dx, dy, 0.0)), skip_selected=True)
+        st.bound_xy = (x, y)
+    finally:
+        _QUIET["carry"] = False
+
+
+def floor_selects_space(scene, view_layer):
+    """Clicking the studio floor selects the studio space (they are one thing)."""
+    if view_layer is None:
+        return
+    floors = [o for o in view_layer.objects.selected if is_studio_floor(o)]
+    if not floors:
+        return
+    b = boundary_of(scene)
+    if b is None:
+        return
+    was_active = view_layer.objects.active in floors
+    for f in floors:
+        f.select_set(False, view_layer=view_layer)
+    if b.hide_select or not b.visible_get(view_layer=view_layer):
+        return
+    b.select_set(True, view_layer=view_layer)
+    if was_active:
+        view_layer.objects.active = b
+
+
 def _bbst_on_depsgraph(scene, depsgraph):
     """Mark the beat at the playhead orange when a staged object moves off its saved keys."""
+    if scene is not None and is_staging(scene) and not _QUIET["carry"]:
+        try:
+            follow_studio_space(scene)
+        except Exception as e:
+            print("BB Stage studio follow:", e)
+        try:
+            floor_selects_space(scene, depsgraph.view_layer)
+        except Exception as e:
+            print("BB Stage floor select:", e)
     try:
         if (scene is not None and is_staging(scene)
                 and any(isinstance(u.id, bpy.types.Object) and not u.is_updated_transform
@@ -816,6 +902,13 @@ def _select_row(context, kind, idx):
         _select_only(context, c.objects[idx])
 
 
+def _handles_update(self, context):
+    """Edit Studio (Easy) or Easy handles (Artist) changed: new tool, studio (un)locked."""
+    for w in stage_windows():
+        apply_mode_tool(w)
+    request_sync(0.0)
+
+
 class BBST_Props(bpy.types.PropertyGroup):
     mode: bpy.props.EnumProperty(name="Mode", items=[
         ('EASY', "Easy", "Characters, beats and cameras only"),
@@ -881,6 +974,17 @@ class BBST_Props(bpy.types.PropertyGroup):
     floor_z: bpy.props.FloatProperty(name="Studio floor height (m)", default=0.0, soft_min=-5, soft_max=30,
                                      description="Where characters stand and cameras measure eye level from")
     needs_place: bpy.props.BoolProperty(default=False)
+    bound_xy: bpy.props.FloatVectorProperty(size=2)      # where the studio space was: moves carry the rest
+    bound_xy_set: bpy.props.BoolProperty(default=False)
+    # ---- v0.10: handles (file level, read from the set scene)
+    artist_handles: bpy.props.BoolProperty(
+        name="Easy handles in Artist Mode", default=False, update=_handles_update,
+        description="Click and drag to move, with turn and move handles on whatever you click, "
+                    "like Easy Mode. Off: select, then use the shortcuts (G, R, S, Tab)")
+    edit_studio: bpy.props.BoolProperty(
+        name="Edit Studio", default=False, update=_handles_update,
+        description="Easy Mode: unlock the studio space, its floor, walls and pieces so they can be "
+                    "moved (and the studio resized). Off, clicks go through to the characters")
     # ---- v0.8: what each pane shows (per staging)
     work_world: bpy.props.EnumProperty(name="Plan shows", items=WORLD_ITEMS, default='GHOST')
     work_shading: bpy.props.EnumProperty(items=SHADING_ITEMS, default='SOLID')
@@ -1035,20 +1139,27 @@ def refresh_floor(scene, carry=True):
         carry_with_studio(scene, Vector((0.0, 0.0, st.floor_z - old)))
 
 
-def _carried_objects(scene):
+def _carried_objects(scene, skip_selected=False):
     b = boundary_of(scene)
     obs = set(stage_objects(scene, roles=("char", "prop", "cam"))) | set(stage_cams(scene))
     for c in layer_colls(scene, "STUDIO"):
         obs |= {o for o in coll_objects(c) if o != b}
     # stand-ins / matched pieces sit where their set object is: they never move with the studio
-    return [o for o in obs if o.parent is None and o.get(SOURCE_KEY) is None]
+    out = [o for o in obs if o.parent is None and o.get(SOURCE_KEY) is None]
+    if skip_selected:      # a drag that moves them along with the studio already moved them
+        out = [o for o in out if not o.select_get()]
+    return out
 
 
-def carry_with_studio(scene, d):
+def carry_with_studio(scene, d, skip_selected=False):
     """Move the studio's pieces, pegs and cameras by d, their beat keys included."""
     if d.length < 1e-5:
         return
-    for ob in _carried_objects(scene):
+    st = scene.bb_st
+    i = beat_at_frame(scene) if len(st.beats) else None
+    if i is not None and st.beats[i].dirty:
+        save_beat(scene, i)     # shifting the keys re-reads them: unsaved moves would be lost
+    for ob in _carried_objects(scene, skip_selected):
         ob.location += d
         ad = ob.animation_data
         for fc in (channelbag_fcurves(ad.action) if ad and ad.action else []):
@@ -1091,6 +1202,7 @@ def build_studio_shell(scene):
                              color=SHELL_WHITE)
     floor["bb_st_kind"] = "Studio floor"
     place(floor, (0.0, 0.0, -0.04))          # its top is the studio floor
+    lock_floor(floor)
     n = max(0, st.wall_count)
     if n:
         ww = min(st.wall_width, w / n)
@@ -1101,6 +1213,18 @@ def build_studio_shell(scene):
             wall["bb_st_kind"] = "Studio wall"
             place(wall, (x0 + i * ww, d / 2 - 0.05, 0.0))
     st.shell_built = True
+
+
+def lock_floor(ob):
+    """The studio floor and the studio space are one thing (Aman, 5 Oct 2026): clicking the
+    floor selects the space, and the floor itself never moves on its own."""
+    ob.lock_location = (True, True, True)
+    ob.lock_rotation = (True, True, True)
+    ob.lock_scale = (True, True, True)
+
+
+def is_studio_floor(ob):
+    return ob is not None and ob.get(SHELL_KEY) and ob.get("bb_st_kind") == "Studio floor"
 
 
 def cursor_to_studio(scene):
@@ -1244,6 +1368,8 @@ class BBST_OT_new_staging(bpy.types.Operator):
         bound.location = (centre.x, centre.y, 0.0)
         st.floor_z = detect_floor_z(sc, centre.x, centre.y, level)
         bound.location.z = st.floor_z
+        st.bound_xy = (centre.x, centre.y)
+        st.bound_xy_set = True
         build_studio_shell(sc)
         cam = make_stage_camera(sc)
         if cam is not None:
@@ -2096,9 +2222,10 @@ def _declutter(space, names=True, sidebar=False):
     space.show_region_tool_header = False   # active-tool strip (and add-on widgets in it)
     try:
         space.show_region_ui = sidebar
+        space.show_region_hud = False        # Blender's "Adjust Last Operation" box after a drag
     except Exception:
         pass
-    # gizmos on, but only the active tool's handles (move / rotate / scale on what you click)
+    # gizmos on for BB Stage's own handles; Blender's object handles stay off
     space.show_gizmo = True
     for attr, val in (("show_gizmo_navigate", False), ("show_gizmo_context", True), ("show_gizmo_tool", True),
                       ("show_gizmo_object_translate", False), ("show_gizmo_object_rotate", False),
@@ -2281,11 +2408,28 @@ def _ensure_local_view(win, area, scene):
     return sp.local_view is not None
 
 
+def apply_studio_lock(scene, locked):
+    """Easy Mode: the studio (space, floor, walls, pieces) can't be clicked until Edit Studio
+    is on, so a drag on the floor never moves the set build by accident."""
+    for c in layer_colls(scene, "STUDIO"):
+        if c.hide_select != locked:
+            c.hide_select = locked
+        if locked:
+            for ob in coll_objects(c):
+                for vl in scene.view_layers:
+                    try:
+                        if ob.select_get(view_layer=vl):
+                            ob.select_set(False, view_layer=vl)
+                    except RuntimeError:
+                        pass
+
+
 def sync_window(win, scene):
     st = scene.bb_st
     roles = stage_panes(win)
     if not roles:
         return
+    apply_studio_lock(scene, not studio_editable())
     _LAST_STG[win.as_pointer()] = scene.name
     _SYNC["last_error"] = ""      # this pass reports afresh; cut and local-view errors add to it
     sync_peg_colors(scene)
@@ -2608,6 +2752,11 @@ def _stage_header_draw(self, context):
                 r = lay.row()
                 r.alert = st.needs_place
                 r.operator("bbst.place_space", text="Place Studio Space", icon='OBJECT_ORIGIN')
+            else:
+                fs = fstate()
+                if fs is not None:
+                    lay.prop(fs, "edit_studio", text="Edit Studio", toggle=True,
+                             icon='UNLOCKED' if fs.edit_studio else 'LOCKED')
         if _SYNC.get("last_error"):
             r = lay.row()
             r.alert = True
@@ -2873,6 +3022,8 @@ def _bbst_after_exit():
         return 0.2 if _EXIT["tries"] < 15 else None
     _EXIT["pending"] = False
     untint_everything()
+    for s in stagings():
+        apply_studio_lock(s, False)     # plain Blender: everything clickable again
     _restore_foreign_v3d_panels()
     ms = master_scene()
     for w in bpy.context.window_manager.windows:
@@ -2893,6 +3044,8 @@ class BBST_OT_enter_stage(bpy.types.Operator):
         if fs is None:
             return {'CANCELLED'}
         fs.mode = 'EASY' if self.easy else 'ARTIST'
+        if self.easy and fs.edit_studio:
+            fs["edit_studio"] = False         # Easy always starts with the studio locked
         if _in_stage(context) and not _EXIT["pending"]:
             apply_mode_tool(context.window)        # switching Easy ⇄ Artist changes the tool
             request_sync(0.0)
@@ -3011,13 +3164,277 @@ def _build_stage_screen(scene_name):
     bpy.app.timers.register(step, first_interval=0.05)
 
 
+# ------------------------------------------------------------------ handles (gizmos)
+#
+# Aman, 5 Oct 2026: a click-drag already moves things, so the handles give what a drag can't:
+# rings to turn, and plane squares to move on one plane. No arrows, and no scaling of
+# characters or props. The studio space (its floor counts as the same thing) gets a move handle
+# in the middle and resize handles on its edges and corners, no rotation.
+
+AX_COL = {'X': (0.96, 0.22, 0.32), 'Y': (0.55, 0.86, 0.0), 'Z': (0.17, 0.56, 1.0)}
+_RING_AXES = {"char": "Z", "piece": "Z", "cam": "Z", "prop": "XYZ"}
+_PLANES = {"char": ("XY",), "piece": ("XY",), "cam": ("XY", "XZ", "YZ"), "prop": ("XY", "XZ", "YZ")}
+_PLANE_AXES = {"XY": (True, True, False), "XZ": (True, False, True), "YZ": (False, True, True)}
+_PLANE_COL = {"XY": 'Z', "XZ": 'Y', "YZ": 'X'}       # coloured like the axis it does not move along
+_RESIZE = {'E': (1, 0), 'W': (-1, 0), 'N': (0, 1), 'S': (0, -1),
+           'NE': (1, 1), 'NW': (-1, 1), 'SE': (1, -1), 'SW': (-1, -1)}
+_SPACE_COL = (1.0, 0.78, 0.15)
+_HANDLES = {}       # region pointer -> its handles group (read by the GUI tests)
+
+
+def handles_on():
+    """Handles and click-drag moving: always in Easy Mode, in Artist only from Settings."""
+    fs = fstate()
+    return _mode() == 'EASY' or bool(fs is not None and fs.artist_handles)
+
+
+def studio_editable():
+    """Artist can always change the studio; Easy only while Edit Studio is on."""
+    fs = fstate()
+    return _mode() == 'ARTIST' or bool(fs is not None and fs.edit_studio)
+
+
+def handle_kind(scene, ob):
+    """Which handles an object gets: char / prop / cam / piece / space, or None."""
+    if ob is None or ob.get(LOCK_KEY):
+        return None
+    role = ob.get(ROLE_KEY)
+    if role in ("char", "prop", "cam"):
+        return role
+    if role == "boundary" or is_studio_floor(ob):
+        return "space" if studio_editable() else None
+    if role == "studio":
+        return "piece" if studio_editable() else None
+    return None
+
+
+def _axis_matrix(axis):
+    """Orientation whose local Z is this world axis (a ring turns about its local Z)."""
+    if axis == 'X':
+        return Matrix.Rotation(math.pi / 2, 4, 'Y')
+    if axis == 'Y':
+        return Matrix.Rotation(-math.pi / 2, 4, 'X')
+    return Matrix.Identity(4)
+
+
+def _plane_matrix(plane):
+    """Orientation whose local XY is this world plane (a plane square lies in its local XY)."""
+    if plane == "XZ":
+        return Matrix.Rotation(math.pi / 2, 4, 'X')
+    if plane == "YZ":
+        return Matrix.Rotation(-math.pi / 2, 4, 'Y')
+    return Matrix.Identity(4)
+
+
+def _style(gz, color, alpha=0.85):
+    gz.color = color
+    gz.alpha = alpha
+    gz.color_highlight = (1.0, 1.0, 1.0)
+    gz.alpha_highlight = 1.0
+    gz.use_draw_scale = True
+
+
+class BBST_GGT_handles(bpy.types.GizmoGroup):
+    bl_idname = "BBST_GGT_handles"
+    bl_label = "BB Stage handles"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'WINDOW'
+    bl_options = {'3D', 'PERSISTENT'}
+
+    @classmethod
+    def poll(cls, context):
+        try:
+            if not (_in_stage(context) and handles_on()):
+                return False
+            ob = context.active_object
+            return ob is not None and ob.select_get() and handle_kind(context.scene, ob) is not None
+        except Exception:
+            return False
+
+    def setup(self, context):
+        self.rings, self.planes, self.resize = {}, {}, {}
+        for ax in "XYZ":
+            gz = self.gizmos.new("GIZMO_GT_dial_3d")
+            op = gz.target_set_operator("transform.rotate")
+            op.orient_axis = ax
+            op.orient_type = 'GLOBAL'
+            op.constraint_axis = (ax == 'X', ax == 'Y', ax == 'Z')
+            op.release_confirm = True
+            gz.draw_options = set() if ax == 'Z' else {'CLIP'}
+            gz.line_width = 3.0
+            gz.scale_basis = 1.0
+            _style(gz, AX_COL[ax])
+            self.rings[ax] = gz
+        for pl, axes in _PLANE_AXES.items():
+            gz = self.gizmos.new("GIZMO_GT_primitive_3d")
+            gz.draw_style = 'PLANE'
+            op = gz.target_set_operator("transform.translate")
+            op.orient_type = 'GLOBAL'
+            op.constraint_axis = axes
+            op.release_confirm = True
+            gz.matrix_offset = Matrix.Translation((0.42, 0.42, 0.0)) @ Matrix.Scale(0.2, 4)
+            _style(gz, AX_COL[_PLANE_COL[pl]], 0.75)
+            self.planes[pl] = gz
+        gz = self.gizmos.new("GIZMO_GT_move_3d")          # the studio space: move from the middle
+        gz.draw_style = 'RING_2D'
+        gz.draw_options = {'FILL_SELECT', 'ALIGN_VIEW'}
+        op = gz.target_set_operator("transform.translate")
+        op.orient_type = 'GLOBAL'
+        op.constraint_axis = (True, True, False)
+        op.release_confirm = True
+        gz.scale_basis = 0.35
+        gz.line_width = 3.0
+        _style(gz, _SPACE_COL, 0.9)
+        self.move = gz
+        for key in _RESIZE:                               # ... and resize from its edges
+            gz = self.gizmos.new("GIZMO_GT_primitive_3d")
+            gz.draw_style = 'PLANE'
+            gz.target_set_operator("bbst.studio_resize").handle = key
+            gz.matrix_offset = Matrix.Scale(0.13 if len(key) == 2 else 0.10, 4)
+            _style(gz, _SPACE_COL, 0.9)
+            self.resize[key] = gz
+        if context.region is not None:
+            _HANDLES[context.region.as_pointer()] = self
+        self._place(context)
+
+    def refresh(self, context):
+        self._place(context)
+
+    def draw_prepare(self, context):
+        self._place(context)
+
+    def _place(self, context):
+        for gz in self.gizmos:
+            gz.hide = True
+        try:
+            scene = context.scene
+            ob = context.active_object
+            kind = handle_kind(scene, ob) if (ob is not None and ob.select_get()) else None
+            sp = context.space_data
+            r3d = getattr(sp, "region_3d", None)
+            if kind is not None and r3d is not None and r3d.view_perspective == 'CAMERA':
+                if (sp.camera if sp.use_local_camera else scene.camera) == ob:
+                    kind = None         # never handles on the camera this pane looks through
+            scr = context.screen
+            if kind is None or (scr is not None and scr.is_animation_playing):
+                return
+            if kind == "space":
+                self._place_space(scene)
+                return
+            base = Matrix.Translation(ob.matrix_world.translation)
+            for ax in _RING_AXES[kind]:
+                gz = self.rings[ax]
+                gz.matrix_basis = base @ _axis_matrix(ax)
+                gz.hide = False
+            for pl in _PLANES[kind]:
+                gz = self.planes[pl]
+                gz.matrix_basis = base @ _plane_matrix(pl)
+                gz.hide = False
+        except Exception as e:
+            print("BB Stage handles:", e)
+
+    def _place_space(self, scene):
+        b = boundary_of(scene)
+        if b is None:
+            return
+        st = scene.bb_st
+        rot = Matrix.Rotation(b.rotation_euler.z, 4, 'Z')
+        c = Vector((b.location.x, b.location.y, st.floor_z))
+        self.move.matrix_basis = Matrix.Translation(c) @ rot
+        self.move.hide = False
+        hw, hd = st.studio_w / 2, st.studio_d / 2
+        for key, (sx, sy) in _RESIZE.items():
+            p = c + rot.to_3x3() @ Vector((sx * hw, sy * hd, 0.0))
+            gz = self.resize[key]
+            gz.matrix_basis = Matrix.Translation(p) @ rot
+            gz.hide = False
+
+
+class BBST_OT_studio_resize(bpy.types.Operator):
+    """Drag to resize the studio from this side; the opposite side stays where it is"""
+    bl_idname = "bbst.studio_resize"
+    bl_label = "Resize Studio"
+    bl_options = {'REGISTER', 'UNDO', 'INTERNAL'}
+
+    handle: bpy.props.EnumProperty(items=[(k, k, "") for k in _RESIZE], default='E')
+    delta: bpy.props.FloatVectorProperty(size=2, default=(0.0, 0.0),
+                                         description="How far the side moved, in metres along the studio's width and depth")
+
+    @classmethod
+    def poll(cls, context):
+        return is_staging(context.scene) and boundary_of(context.scene) is not None
+
+    def _start(self, scene):
+        b = boundary_of(scene)
+        st = scene.bb_st
+        self.w0, self.d0 = st.studio_w, st.studio_d
+        self.c0 = Vector((b.location.x, b.location.y))
+        self.rot = b.rotation_euler.z
+
+    def _apply(self, scene, shell=True):
+        sx, sy = _RESIZE[self.handle]
+        w = min(60.0, max(2.0, self.w0 + sx * self.delta[0])) if sx else self.w0
+        d = min(60.0, max(2.0, self.d0 + sy * self.delta[1])) if sy else self.d0
+        shift = Matrix.Rotation(self.rot, 2) @ Vector((sx * (w - self.w0) / 2, sy * (d - self.d0) / 2))
+        resize_studio(scene, w, d, self.c0.x + shift.x, self.c0.y + shift.y, shell=shell)
+
+    def execute(self, context):
+        self._start(context.scene)
+        self._apply(context.scene)
+        request_sync(0.0)
+        return {'FINISHED'}
+
+    def _floor_hit(self, context, event):
+        from bpy_extras import view3d_utils
+        from mathutils import geometry
+        r = self.region
+        co = (event.mouse_x - r.x, event.mouse_y - r.y)
+        o = view3d_utils.region_2d_to_origin_3d(r, self.r3d, co)
+        v = view3d_utils.region_2d_to_vector_3d(r, self.r3d, co)
+        z = context.scene.bb_st.floor_z
+        return geometry.intersect_line_plane(o, o + v * 1e4, Vector((0.0, 0.0, z)), Vector((0.0, 0.0, 1.0)))
+
+    def invoke(self, context, event):
+        self.region, self.r3d = context.region, context.region_data
+        if self.region is None or self.r3d is None:
+            return self.execute(context)
+        self._start(context.scene)
+        self.p0 = self._floor_hit(context, event)
+        if self.p0 is None:
+            return {'CANCELLED'}
+        self.delta = (0.0, 0.0)
+        context.workspace.status_text_set("Drag to resize the studio · release to finish · Esc cancels")
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        scene = context.scene
+        if event.type == 'MOUSEMOVE':
+            p = self._floor_hit(context, event)
+            if p is not None:
+                d = Matrix.Rotation(-self.rot, 2) @ Vector((p.x - self.p0.x, p.y - self.p0.y))
+                self.delta = (d.x, d.y)
+                self._apply(scene, shell=False)
+        elif event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
+            context.workspace.status_text_set(None)
+            self._apply(scene)
+            return {'FINISHED'}
+        elif event.type in ('ESC', 'RIGHTMOUSE'):
+            context.workspace.status_text_set(None)
+            self.delta = (0.0, 0.0)
+            self._apply(scene, shell=False)
+            return {'CANCELLED'}
+        return {'RUNNING_MODAL'}
+
+
 def apply_mode_tool(win):
-    """Easy Mode: the Transform tool, so clicking a character, prop or wall gives handles to
-    move, turn and scale it without shortcuts. Artist Mode: the Move tool (shortcuts G/R/S)."""
+    """Handles on (Easy Mode, or Artist with Settings › Easy handles): the Tweak tool, so a
+    click-drag moves what is under the mouse, and BB Stage's own handles turn it. Artist
+    otherwise: Select Box, everything by shortcut (G, R, S, Tab) — more manual, more control."""
     work = stage_panes(win).get("WORK")
     if work is None:
         return
-    tool = "builtin.transform" if _mode() == 'EASY' else "builtin.move"
+    tool = "builtin.select" if handles_on() else "builtin.select_box"
     region = next((r for r in work.regions if r.type == 'WINDOW'), None)
     try:
         with bpy.context.temp_override(window=win, screen=win.screen, area=work, region=region):
@@ -3095,6 +3512,40 @@ def _panes_drifted(win):
     return False
 
 
+def _transform_running(wm):
+    return any(op.bl_idname.startswith("TRANSFORM_OT") for w in wm.windows for op in w.modal_operators)
+
+
+def adopt_studio_shape(scene):
+    """Artist scaled the studio space (S) or edited its points (Tab): take the new size back
+    into the studio settings, so the floor, walls and handles follow. The space stays a box."""
+    b = boundary_of(scene)
+    if b is None or b.type != 'MESH' or b.mode != 'OBJECT' or len(b.data.vertices) < 2:
+        return False
+    st = scene.bb_st
+    sx, sy, sz = (abs(v) for v in b.scale)
+    vs = [v.co for v in b.data.vertices]
+    x0, x1 = min(v.x for v in vs), max(v.x for v in vs)
+    y0, y1 = min(v.y for v in vs), max(v.y for v in vs)
+    z0, z1 = min(v.z for v in vs), max(v.z for v in vs)
+    w, d, h = (x1 - x0) * sx, (y1 - y0) * sy, (z1 - z0) * sz
+    ox, oy = (x0 + x1) / 2 * sx, (y0 + y1) / 2 * sy
+    same = (max(abs(sx - 1), abs(sy - 1), abs(sz - 1)) < 1e-4 and abs(w - st.studio_w) < 1e-3
+            and abs(d - st.studio_d) < 1e-3 and abs(h - st.studio_h) < 1e-3
+            and abs(ox) < 1e-3 and abs(oy) < 1e-3 and abs(z0) < 1e-3)
+    if same:
+        return False
+    off = Matrix.Rotation(b.rotation_euler.z, 2) @ Vector((ox, oy))
+    b.scale = (1.0, 1.0, 1.0)
+    _QUIET["dims"] = True
+    try:
+        st.studio_h = min(20.0, max(2.0, h))
+    finally:
+        _QUIET["dims"] = False
+    resize_studio(scene, w, d, b.location.x + off.x, b.location.y + off.y)
+    return True
+
+
 def _bbst_watchdog():
     try:
         wm = bpy.context.window_manager
@@ -3106,6 +3557,12 @@ def _bbst_watchdog():
                 continue
             key = win.as_pointer()
             live.add(key)
+            if is_staging(win.scene) and not _BUILD_STATE["active"] and not _transform_running(wm):
+                try:
+                    if adopt_studio_shape(win.scene):
+                        request_sync(0.0)
+                except Exception as e:
+                    print("BB Stage studio shape:", e)
             sig = _window_signature(win)
             old = _WATCH.get(key)
             if old == sig:
@@ -3458,6 +3915,8 @@ class BBST_OT_place_space(bpy.types.Operator):
             return {'CANCELLED'}
         self.region = next(r for r in self.area.regions if r.type == 'WINDOW')
         self.start = self.bound.location.copy()
+        for ob in context.selected_objects:     # everything unselected rides along with the space
+            ob.select_set(False)
         context.window.cursor_modal_set('SCROLL_XY')
         context.workspace.status_text_set("Move the mouse over the plan · click to drop the studio space · Esc cancels")
         context.window_manager.modal_handler_add(self)
@@ -3469,13 +3928,13 @@ class BBST_OT_place_space(bpy.types.Operator):
         scene = context.scene
         if ok and is_staging(scene):
             scene.bb_st.needs_place = False
-            d = self.bound.location - self.start      # what stands on the studio floor moves with it,
-            carry_with_studio(scene, Vector((d.x, d.y, 0.0)))     # on every placement (z already did)
+            follow_studio_space(scene)      # the contents followed live; catch the last step
             refresh_floor(scene)
             cursor_to_studio(scene)
         else:
             try:
                 self.bound.location = self.start
+                follow_studio_space(scene)      # and the contents go back with it
             except ReferenceError:
                 pass
         request_sync(0.0)
@@ -3950,6 +4409,7 @@ def draw_settings(lay, context):
     lay.prop(st, "beat_spacing")
     lay.prop(st, "black_outside")
     if fs is not None:
+        lay.prop(fs, "artist_handles")
         lay.prop(fs, "mode")
     lay.operator("bbst.fix_screen", icon='FILE_REFRESH')
 
@@ -4161,6 +4621,11 @@ def _bbst_after_load():
 @persistent
 def _bbst_save_pre(*_args):
     untint_everything()        # the set is saved with its own colours, never the ghost tint
+    for s in stagings():
+        try:
+            apply_studio_lock(s, False)     # files open clickable without the add-on; the sync re-locks
+        except Exception:
+            pass
 
 
 @persistent
@@ -4222,6 +4687,7 @@ CLASSES = [
     BBST_OT_pane_cam_pick, BBST_OT_pane_level,
     BBST_OT_enter_stage, BBST_OT_exit_stage, BBST_OT_place_space, BBST_OT_walk,
     BBST_OT_playblast, BBST_OT_export_pack, BBST_OT_top_map,
+    BBST_OT_studio_resize, BBST_GGT_handles,
 ] + PANEL_CLASSES
 
 PROP_CLONES = []
