@@ -77,6 +77,12 @@ v2.15 (3 Oct 2026): Easy Mode gets two depth buttons under the looks - Generate 
      Map, and Multiply with Depth Map, which captures the view and multiplies it by its own
      depth so a drawing gains the distance it cannot show on its own. Both are offered only for
      Clay, Line Art and Flat Colour.
+v2.16 (3 Oct 2026): both modes open in Fast, not Preview. Material Preview compiles a shader
+     per material before it draws anything, which on a heavy set is a long freeze that looks
+     like a crash - and on a 26 million triangle set can be one.
+v2.17 (3 Oct 2026): a Play button in both modes, for mocap takes and anything else keyframed.
+     Both modes hide Blender's timeline, so there was no way to start playback from inside
+     them. It appears only when the scene has something animated.
 
   4. Easy Mode - one panel, one camera. The viewport IS the camera: Walk moves
              it, sliders set focal length, focus distance, depth of field and
@@ -110,7 +116,7 @@ from mathutils import Euler, Matrix, Vector
 bl_info = {
     "name": "BB Set Viewer",
     "author": "Beta Builder",
-    "version": (2, 15, 0),
+    "version": (2, 18, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > BB Set",
     "description": "Game-style WASD navigation and panel-driven camera control",
@@ -329,7 +335,7 @@ class BBSV_Props(PropertyGroup):
         get=_dof_get, set=_dof_set,
     )
     # Capture passes: one press of Capture (or C) saves every pass that is ticked.
-    look_now: StringProperty(default="PREVIEW", options={"HIDDEN"})
+    look_now: StringProperty(default="FAST", options={"HIDDEN"})
     show_minimap: BoolProperty(
         name="Mini Map", default=False,
         description="A plan of the set in the corner of the viewport, with the cameras on it "
@@ -1532,6 +1538,57 @@ def _capture_all(context, area, cam, base_path, keys=None):
     return written
 
 
+class BBSV_OT_play(Operator):
+    """Play or pause the animation - mocap takes, or anything else keyframed in the set"""
+
+    bl_idname = "bb_sv.play"
+    bl_label = "Play Animation"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        # Both modes hide Blender's timeline, so this button is the only way to start playback.
+        try:
+            bpy.ops.screen.animation_play()
+        except RuntimeError as exc:
+            _flash("Could not start playback (%s)" % exc, seconds=4)
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class BBSV_OT_rewind(Operator):
+    """Go back to the first frame"""
+
+    bl_idname = "bb_sv.rewind"
+    bl_label = "Back to Start"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        context.scene.frame_set(context.scene.frame_start)
+        return {"FINISHED"}
+
+
+def _draw_play(lay, context):
+    """Play, and a way back to frame one. Shown whenever the scene has anything animated."""
+    scene = context.scene
+    animated = any(o.animation_data and (o.animation_data.action or o.animation_data.nla_tracks)
+                   for o in scene.objects)
+    if not animated:
+        animated = any(o.type == "ARMATURE" for o in scene.objects)
+    if not animated:
+        return
+    playing = getattr(context.screen, "is_animation_playing", False)
+    row = lay.row(align=True)
+    row.scale_y = 1.3
+    row.operator("bb_sv.play", text="Pause" if playing else "Play",
+                 icon="PAUSE" if playing else "PLAY", depress=playing)
+    sub = row.row(align=True)
+    sub.scale_x = 0.45
+    sub.operator("bb_sv.rewind", text="", icon="REW")
+    sub = lay.row()
+    sub.scale_y = 0.6
+    sub.label(text="Frame %d of %d-%d" % (scene.frame_current, scene.frame_start, scene.frame_end))
+
+
 class BBSV_OT_clear_cameras(Operator):
     """Delete every camera in the scene - including any the art team left behind"""
 
@@ -2003,6 +2060,12 @@ def enter_artist_mode(window, easy=None):
     space = area.spaces.active
     _style_view(scene, space, True)
     space.show_object_viewport_light = True     # files stripped by v2.5 or earlier saved it off
+    # Open in Fast. A heavy set in Material Preview has to compile a shader for every material
+    # before it will draw, which is a long freeze and the easiest way to make Blender look
+    # hung - or run a laptop out of memory. Fast draws immediately; the look buttons are right
+    # there when the shot is framed.
+    _apply_look(space.shading, "FAST", scene)
+    scene.bb_sv.look_now = "FAST"
     _scene_lighting(space.shading, scene.bb_sv.scene_lights)
     _lock_set(scene, True)
     _ARTIST["on"] = True
@@ -2324,7 +2387,8 @@ def _easy_setup(window, area):
     quat = rv3d.view_rotation.copy()
     eye = rv3d.view_location + quat @ Vector((0.0, 0.0, rv3d.view_distance))
     easy_camera(window.scene, eye, quat)
-    space.shading.type = "MATERIAL"
+    _apply_look(space.shading, "FAST", window.scene)        # same reason as Artist Mode
+    window.scene.bb_sv.look_now = "FAST"
     _scene_lighting(space.shading, window.scene.bb_sv.scene_lights)
     space.overlay.show_extras = False           # no light or camera outlines over the shot
     rv3d.view_perspective = "CAMERA"
@@ -2524,6 +2588,7 @@ class BBSV_PT_easy(Panel):
         sub = row.row(align=True)
         sub.scale_x = 0.55
         sub.prop(p, "speed", text="")
+        _draw_play(lay, context)
 
         lay.separator()
         _draw_looks(lay, p, columns=2)      # in Easy Mode the looks ARE the choice
@@ -2578,7 +2643,9 @@ class _BBPanel:
 
     @classmethod
     def poll(cls, context):
-        if _ARTIST.get("easy"):
+        # Outside Artist/Easy Mode the sidebar shows only the two enter buttons
+        # (BBSV_PT_mode); the tools appear once you are in the mode (Aman, 4 Oct 2026).
+        if not artist_on() or _ARTIST.get("easy"):
             return False
         return not cls.flag or getattr(context.scene.bb_sv, cls.flag)
 
@@ -2809,6 +2876,7 @@ class BBSV_PT_shot(_BBPanel, Panel):
         sub = row.row(align=True)
         sub.scale_x = 0.55
         sub.prop(p, "speed", text="")
+        _draw_play(lay, context)
 
         lay.separator()
         _draw_looks(lay, p)
@@ -3060,6 +3128,8 @@ CLASSES = (
     BBSV_OT_rename_camera,
     BBSV_OT_delete_camera,
     BBSV_OT_capture,
+    BBSV_OT_play,
+    BBSV_OT_rewind,
     BBSV_OT_clear_cameras,
     BBSV_OT_refresh_map,
     BBSV_OT_open_captures,

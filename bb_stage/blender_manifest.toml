@@ -1,0 +1,15 @@
+schema_version = "1.0.0"
+
+id = "bb_stage"
+version = "0.9.0"
+name = "BB Stage"
+tagline = "Staging and blocking previs: studio, beats and cameras"
+maintainer = "Lakao456"
+type = "add-on"
+website = "https://github.com/Lakao456/bb-set-viewer"
+tags = ["3D View", "Animation", "Camera"]
+blender_version_min = "5.0.0"
+license = ["SPDX:GPL-2.0-or-later"]
+
+[permissions]
+files = "Save the staging pack, plans and playblasts next to the set file"

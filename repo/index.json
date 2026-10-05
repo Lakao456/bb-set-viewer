@@ -27,7 +27,7 @@
       "id": "bb_set_viewer",
       "name": "BB Set Viewer",
       "tagline": "Game-style walk and one-panel camera for film set previs",
-      "version": "2.15.0",
+      "version": "2.18.0",
       "type": "add-on",
       "maintainer": "Lakao456",
       "license": [
@@ -42,9 +42,9 @@
         "3D View",
         "Camera"
       ],
-      "archive_url": "./bb_set_viewer-2.15.0.zip",
-      "archive_size": 33717,
-      "archive_hash": "sha256:163717d521659bd95febd0c9302ce54a9d5f4609c2f58652aeb592cb1f454112"
+      "archive_url": "./bb_set_viewer-2.18.0.zip",
+      "archive_size": 34683,
+      "archive_hash": "sha256:e3b9db32b3a5aeaed08fe30cba345ab6c553d85a1ad26edeb0a1e3fbe4aed2eb"
     },
     {
       "schema_version": "1.0.0",
@@ -68,6 +68,31 @@
       "archive_url": "./bb_skp_convert-1.0.0.zip",
       "archive_size": 15237,
       "archive_hash": "sha256:4cba549c7db62d28633e5b84512a62654193966a25ef9b747e6c861f8af0d755"
+    },
+    {
+      "schema_version": "1.0.0",
+      "id": "bb_stage",
+      "name": "BB Stage",
+      "tagline": "Staging and blocking previs: studio, beats and cameras",
+      "version": "0.9.0",
+      "type": "add-on",
+      "maintainer": "Lakao456",
+      "license": [
+        "SPDX:GPL-2.0-or-later"
+      ],
+      "blender_version_min": "5.0.0",
+      "website": "https://github.com/Lakao456/bb-set-viewer",
+      "permissions": {
+        "files": "Save the staging pack, plans and playblasts next to the set file"
+      },
+      "tags": [
+        "3D View",
+        "Animation",
+        "Camera"
+      ],
+      "archive_url": "./bb_stage-0.9.0.zip",
+      "archive_size": 45080,
+      "archive_hash": "sha256:6f6f4f298704ee8e5a1f3e7f2f9d4d404574b925ae7b84066ef7cebd483d63ac"
     }
   ]
 }
