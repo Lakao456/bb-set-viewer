@@ -118,7 +118,7 @@ from mathutils import Euler, Matrix, Vector
 bl_info = {
     "name": "BB Set Viewer",
     "author": "Beta Builder",
-    "version": (2, 20, 0),
+    "version": (2, 21, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > BB Set",
     "description": "Game-style WASD navigation and panel-driven camera control",
@@ -1225,8 +1225,9 @@ def _is_blank(path):
         bpy.data.images.remove(img)
 
 
-def _grab_view(context, area, path):
-    """Save the camera's view exactly as drawn (no overlays, never a render). False if nothing saved."""
+def _grab_view(context, area, path, allow_rendered=False):
+    """Save the camera's view exactly as drawn (no overlays, never a render). False if nothing
+    saved. allow_rendered keeps Rendered shading, which the mist pass needs."""
     r = context.scene.render
     keep = (r.filepath, r.image_settings.file_format)
     r.filepath = path
@@ -1236,7 +1237,7 @@ def _grab_view(context, area, path):
     persp, overlays, shading = rv3d.view_perspective, space.overlay.show_overlays, space.shading.type
     rv3d.view_perspective = "CAMERA"
     space.overlay.show_overlays = False      # no camera frames or focus markers in the still
-    if shading == "RENDERED":                # a grab of the view, never a render
+    if shading == "RENDERED" and not allow_rendered:   # a grab of the view, never a render
         space.shading.type = "SOLID"
     region = next(rg for rg in area.regions if rg.type == "WINDOW")
     try:
@@ -1335,6 +1336,7 @@ def _apply_look(shading, key, scene=None):
             sh.color_type = "MATERIAL"
 
 
+DEPTH_GRID = 9            # rays across the frame when measuring what the camera can see
 DEPTH_SAMPLES = 16        # a depth map needs no sampling; this is pure insurance
 LINEART_SCALE = 2          # drawn at twice the frame size: finer, denser lines
 LINEART_CONTRAST = 1.0     # how hard the saved image is pushed to ink on paper
@@ -1437,6 +1439,102 @@ def _depth_node_group(scene, near_white):
     ng.links.new(norm.outputs["Value"], ramp.inputs["Factor"])
     ng.links.new(ramp.outputs["Color"], out.inputs[0])
     return ng
+
+
+def _visible_depth_range(context, cam):
+    """How near and how far the camera can actually see, by firing a grid of rays through the
+    frame. Taking the range from the whole set instead puts one room into a sliver of the
+    gradient, which is what made the first depth maps look flat."""
+    scene = context.scene
+    dg = context.evaluated_depsgraph_get()
+    eye = cam.matrix_world.translation
+    mat = cam.matrix_world.to_3x3()
+    frame = [mat @ v for v in cam.data.view_frame(scene=scene)]
+    hits = []
+    for i in range(DEPTH_GRID):
+        for j in range(DEPTH_GRID):
+            u, v = i / (DEPTH_GRID - 1.0), j / (DEPTH_GRID - 1.0)
+            top = frame[0].lerp(frame[1], u)
+            bottom = frame[3].lerp(frame[2], u)
+            d = top.lerp(bottom, v).normalized()
+            hit, loc, _n, _i, _o, _m = scene.ray_cast(dg, eye, d)
+            if hit:
+                hits.append((loc - eye).length)
+    if not hits:
+        return cam.data.clip_start, min(cam.data.clip_end, 50.0)
+    near = max(cam.data.clip_start, min(hits) * 0.97)
+    far = max(near + 0.05, max(hits) * 1.03)
+    return near, far
+
+
+def _capture_mist(context, area, cam, path):
+    """Grab the viewport's Mist pass instead of rendering a depth map.
+
+    Mist is depth, already normalised between a near and a far distance, and EEVEE can show it
+    live - so this is a viewport grab, not a render: instant, and nothing to compile. The range
+    is set from what the camera can see. Mist runs black at the camera to white in the distance,
+    so the saved image is inverted to put white nearest, which is the way depth maps are used."""
+    scene = context.scene
+    _force_eevee(scene)
+    vl = context.view_layer
+    space = area.spaces.active
+    sh = space.shading
+    world = scene.world
+    if world is None:
+        world = bpy.data.worlds.new("World")
+        scene.world = world
+
+    keep_pass = vl.use_pass_mist
+    keep_mist = (world.mist_settings.use_mist, world.mist_settings.start,
+                 world.mist_settings.depth, world.mist_settings.falloff)
+    keep_shading = (sh.type, getattr(sh, "render_pass", "COMBINED"))
+    try:
+        vl.use_pass_mist = True
+        near, far = _visible_depth_range(context, cam)
+        ms = world.mist_settings
+        ms.use_mist, ms.start, ms.depth = True, near, max(0.05, far - near)
+        ms.falloff = "LINEAR"            # depth, not atmosphere: no curve on it
+        sh.type = "RENDERED"
+        if not _enum_ok(sh, "render_pass", "MIST"):
+            return False
+        sh.render_pass = "MIST"
+        ok = _grab_view(context, area, path, allow_rendered=True)
+    finally:
+        sh.type, rp = keep_shading[0], keep_shading[1]
+        try:
+            sh.render_pass = rp
+        except (TypeError, AttributeError):
+            pass
+        (world.mist_settings.use_mist, world.mist_settings.start,
+         world.mist_settings.depth, world.mist_settings.falloff) = keep_mist
+        vl.use_pass_mist = keep_pass
+    if ok and scene.bb_sv.depth_near_white:
+        _invert_image(path)              # mist is black near, white far - flip it
+    return ok
+
+
+def _invert_image(path):
+    """Flip black and white on a saved greyscale image."""
+    try:
+        import numpy as np
+        img = bpy.data.images.load(path, check_existing=False)
+    except Exception:
+        return False
+    try:
+        px = np.empty(len(img.pixels), dtype=np.float32)
+        img.pixels.foreach_get(px)
+        a = px.reshape(-1, 4)
+        a[:, :3] = 1.0 - a[:, :3]
+        a[:, 3] = 1.0
+        img.pixels.foreach_set(a.ravel())
+        img.filepath_raw = path
+        img.file_format = "PNG"
+        img.save()
+        return True
+    except Exception:
+        return False
+    finally:
+        bpy.data.images.remove(img)
 
 
 def _render_depth(context, cam, path):
@@ -1547,10 +1645,19 @@ def _lift_lines(path, strength=1.0):
         bpy.data.images.remove(img)
 
 
+def _depth_image(context, area, cam, path):
+    """A depth map, the cheapest way available: the viewport's mist pass if this Blender can
+    show it, and a render only as a fallback."""
+    if _capture_mist(context, area, cam, path):
+        return True
+    _flash("Mist pass unavailable - rendering the depth map instead", seconds=4)
+    return _render_depth(context, cam, path)
+
+
 def _capture_pass(context, area, cam, key, path):
     """One pass. Everything except the depth map is a grab of the viewport, so it is instant."""
     if key == "depth":
-        return _render_depth(context, cam, path)
+        return _depth_image(context, area, cam, path)
     space = area.spaces.active
     sh = space.shading
     keep = {a: (tuple(getattr(sh, a)) if a in ("single_color", "background_color",
@@ -2597,8 +2704,8 @@ class BBSV_OT_easy_depth(Operator):
             return {"CANCELLED"}
         base = _capture_path(cam, "QUICK")
         path = _pass_path(base, "depth")
-        _flash("Rendering the depth map...", seconds=3)
-        if not _render_depth(context, cam, path):
+        _flash("Making the depth map...", seconds=3)
+        if not _depth_image(context, area, cam, path):
             return {"CANCELLED"}
         _flash("Depth map saved: %s" % os.path.basename(path), seconds=5)
         self.report({"INFO"}, path)
@@ -2631,7 +2738,7 @@ class BBSV_OT_easy_depth_multiply(Operator):
             return {"CANCELLED"}
         if look == "LINE":
             _lift_lines(art, LINEART_CONTRAST)      # the drawing has to be ink on paper first
-        made = _render_depth(context, cam, depth) and _multiply_with_depth(art, depth, out)
+        made = _depth_image(context, area, cam, depth) and _multiply_with_depth(art, depth, out)
         for tmp in (art, depth):        # the separate button is there for anyone who wants these
             try:
                 os.remove(tmp)
