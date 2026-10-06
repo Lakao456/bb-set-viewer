@@ -97,6 +97,8 @@ import json
 import math
 import os
 import re
+import subprocess
+import sys
 import time
 
 import blf
@@ -116,7 +118,7 @@ from mathutils import Euler, Matrix, Vector
 bl_info = {
     "name": "BB Set Viewer",
     "author": "Beta Builder",
-    "version": (2, 18, 0),
+    "version": (2, 20, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > BB Set",
     "description": "Game-style WASD navigation and panel-driven camera control",
@@ -336,6 +338,15 @@ class BBSV_Props(PropertyGroup):
     )
     # Capture passes: one press of Capture (or C) saves every pass that is ticked.
     look_now: StringProperty(default="FAST", options={"HIDDEN"})
+    capture_size: EnumProperty(
+        name="Capture Size",
+        description="How big the saved pictures are. The frame shape is set separately",
+        items=[("1K", "1K", "1920 px on the long edge"),
+               ("2K", "2K", "2560 px on the long edge - the default"),
+               ("4K", "4K", "3840 px on the long edge - slower, and four times the file size")],
+        default="2K",
+        update=lambda self, ctx: _apply_capture_size(ctx.scene),
+    )
     show_minimap: BoolProperty(
         name="Mini Map", default=False,
         description="A plan of the set in the corner of the viewport, with the cameras on it "
@@ -854,7 +865,24 @@ LENS_PRESETS = (18, 24, 35, 50, 85, 135)
 # so a keyboard with a numpad works either way.
 LENS_BY_KEY = dict(zip(("ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX"), LENS_PRESETS))
 LENS_BY_KEY.update(zip(("NUMPAD_%d" % i for i in range(1, len(LENS_PRESETS) + 1)), LENS_PRESETS))
-ASPECTS = (  # label, width, height
+# Capture size, as the long edge in pixels. The frame SHAPE is chosen separately (ASPECTS);
+# this only decides how many pixels that shape is rendered at, so the two never fight.
+CAPTURE_SIZES = (("1K", 1920), ("2K", 2560), ("4K", 3840))
+CAPTURE_LONG_EDGE = dict(CAPTURE_SIZES)
+
+
+def _apply_capture_size(scene):
+    """Rescale the render to the chosen size, keeping whatever frame shape is set."""
+    r = scene.render
+    w, h = max(1, r.resolution_x), max(1, r.resolution_y)
+    long_edge = CAPTURE_LONG_EDGE.get(scene.bb_sv.capture_size, 2560)
+    scale = long_edge / float(max(w, h))
+    r.resolution_x = max(2, int(round(w * scale / 2.0)) * 2)      # even numbers encode cleanly
+    r.resolution_y = max(2, int(round(h * scale / 2.0)) * 2)
+    r.resolution_percentage = 100
+
+
+ASPECTS = (  # label, width, height - the SHAPE; the size above decides the pixels
     ("16:9", 1920, 1080),
     ("2.39:1", 1920, 804),
     ("9:16", 1080, 1920),
@@ -903,6 +931,7 @@ class BBSV_OT_set_aspect(Operator):
     def execute(self, context):
         r = context.scene.render
         r.resolution_x, r.resolution_y, r.resolution_percentage = self.width, self.height, 100
+        _apply_capture_size(context.scene)       # the shape changed, the size stays as chosen
         return {"FINISHED"}
 
 
@@ -1132,6 +1161,7 @@ class BBSV_OT_delete_camera(Operator):
 
 CAPTURE_DIR = "//Captures"
 _RENDER_KEEP = {}
+_LAST_SHOT = {"folder": ""}       # the folder the last Artist Mode capture went into
 
 
 def _capture_dir():
@@ -1139,6 +1169,18 @@ def _capture_dir():
         folder = bpy.path.abspath(CAPTURE_DIR)
     else:
         folder = os.path.join(os.path.expanduser("~"), "BB Captures")
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def _shot_folder(name):
+    """A folder of its own for one press of Capture, so a shot's passes stay together instead
+    of a thousand loose files in one directory."""
+    folder = os.path.join(_capture_dir(), re.sub(r'[\\/:*?"<>|]+', "-", name))
+    n, base = 2, folder
+    while os.path.exists(folder):          # never write into an existing shot's folder
+        folder = "%s (%d)" % (base, n)
+        n += 1
     os.makedirs(folder, exist_ok=True)
     return folder
 
@@ -1293,6 +1335,7 @@ def _apply_look(shading, key, scene=None):
             sh.color_type = "MATERIAL"
 
 
+DEPTH_SAMPLES = 16        # a depth map needs no sampling; this is pure insurance
 LINEART_SCALE = 2          # drawn at twice the frame size: finer, denser lines
 LINEART_CONTRAST = 1.0     # how hard the saved image is pushed to ink on paper
 
@@ -1416,6 +1459,16 @@ def _render_depth(context, cam, path):
     # which is what makes a depth map come out flat and grey.
     vs = scene.view_settings
     keep_view = (vs.view_transform, vs.look, vs.exposure, vs.gamma)
+    # A depth map is a measurement, not a picture: it needs no samples, no ray tracing and
+    # certainly not Cycles. Files get left in Cycles by accident, which turns a two second
+    # job into minutes for a result that looks exactly the same.
+    ee = getattr(scene, "eevee", None)
+    keep_eevee = {}
+    for attr, cheap in (("taa_render_samples", DEPTH_SAMPLES), ("use_raytracing", False),
+                        ("use_shadows", False), ("use_volumetric_lights", False)):
+        if ee is not None and hasattr(ee, attr):
+            keep_eevee[attr] = getattr(ee, attr)
+            setattr(ee, attr, cheap)
     try:
         for name in ("Standard", "Raw"):
             try:
@@ -1439,11 +1492,13 @@ def _render_depth(context, cam, path):
     finally:
         # put the file's own compositor back: every later render would be a depth map otherwise
         scene.compositing_node_group = prev_group
+        for attr, value in keep_eevee.items():
+            setattr(ee, attr, value)
         vs.view_transform, vs.look, vs.exposure, vs.gamma = keep_view
         r.filepath, r.image_settings.file_format, r.image_settings.color_mode = keep
         vl.use_pass_z = keep_z
         if switched:
-            _flash("Render engine set to EEVEE for the depth map", seconds=4)
+            _flash("Switched to EEVEE for the depth map - it does not need Cycles", seconds=4)
     return os.path.exists(path)
 
 
@@ -1674,11 +1729,15 @@ class BBSV_OT_capture(Operator):
             return {"CANCELLED"}
         path = _capture_path(cam, self.kind)
         if self.kind == "QUICK":
+            # one folder per press, holding every pass of that shot
+            folder = _shot_folder(os.path.splitext(os.path.basename(path))[0])
+            path = os.path.join(folder, os.path.basename(path))
             written = _capture_all(context, area, cam, path)
+            _LAST_SHOT["folder"] = folder
             if not written:
                 return {"CANCELLED"}
-            _flash("Captured %d: %s" % (len(written), ", ".join(written)) if len(written) > 1
-                   else "Captured: %s" % written[0], seconds=5)
+            _flash("Captured %d pass(es) into %s" % (len(written), os.path.basename(folder))
+                   if len(written) > 1 else "Captured: %s" % written[0], seconds=5)
             self.report({"INFO"}, "Captured %s" % ", ".join(written))
             return {"FINISHED"}
         _force_eevee(scene)          # no Cycles in this workflow
@@ -1696,13 +1755,32 @@ class BBSV_OT_capture(Operator):
 
 
 class BBSV_OT_open_captures(Operator):
-    """Open the Captures folder"""
+    """Open the Captures folder in Finder or Explorer"""
 
     bl_idname = "bb_sv.open_captures"
     bl_label = "Open Captures Folder"
 
     def execute(self, context):
-        bpy.ops.wm.path_open(filepath=_capture_dir())
+        folder = _LAST_SHOT.get("folder") or _capture_dir()
+        if not os.path.isdir(folder):
+            folder = _capture_dir()
+        # wm.path_open is unreliable on a directory - on macOS it hands Launch Services a path
+        # with no file to open and silently does nothing. Ask the OS directly instead.
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", folder])
+            elif sys.platform.startswith("win"):
+                os.startfile(folder)                                  # noqa: S606
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        except Exception:
+            try:
+                bpy.ops.wm.path_open(filepath=folder)
+            except Exception as exc:
+                _flash("Could not open %s (%s)" % (folder, exc), seconds=6)
+                self.report({"WARNING"}, folder)
+                return {"CANCELLED"}
+        self.report({"INFO"}, folder)
         return {"FINISHED"}
 
 
@@ -2066,6 +2144,7 @@ def enter_artist_mode(window, easy=None):
     # there when the shot is framed.
     _apply_look(space.shading, "FAST", scene)
     scene.bb_sv.look_now = "FAST"
+    _apply_capture_size(scene)
     _scene_lighting(space.shading, scene.bb_sv.scene_lights)
     _lock_set(scene, True)
     _ARTIST["on"] = True
@@ -2389,6 +2468,7 @@ def _easy_setup(window, area):
     easy_camera(window.scene, eye, quat)
     _apply_look(space.shading, "FAST", window.scene)        # same reason as Artist Mode
     window.scene.bb_sv.look_now = "FAST"
+    _apply_capture_size(window.scene)
     _scene_lighting(space.shading, window.scene.bb_sv.scene_lights)
     space.overlay.show_extras = False           # no light or camera outlines over the shot
     rv3d.view_perspective = "CAMERA"
@@ -2626,6 +2706,15 @@ class BBSV_PT_easy_more(Panel):
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
+        lay = self.layout
+        r = context.scene.render
+        lay.label(text="Capture size", icon="IMAGE_DATA")
+        row = lay.row(align=True)
+        row.prop(context.scene.bb_sv, "capture_size", expand=True)
+        sub = lay.row()
+        sub.scale_y = 0.6
+        sub.label(text="Saving at %d x %d" % (r.resolution_x, r.resolution_y))
+        lay.separator()
         self.layout.operator("bb_sv.tutorial", text="Show Tutorial", icon="HELP")
         self.layout.operator("bb_sv.switch_mode", text="Switch to Artist Mode", icon="OUTLINER_OB_CAMERA").easy = False
         self.layout.operator("bb_sv.artist_exit", text="Exit Easy Mode", icon="LOOP_BACK")
@@ -3052,6 +3141,14 @@ class BBSV_PT_settings(_BBPanel, Panel):
         r = context.scene.render
         cam = _active_cam(context)
 
+        lay.label(text="Capture size", icon="IMAGE_DATA")
+        row = lay.row(align=True)
+        row.prop(p, "capture_size", expand=True)
+        sub = lay.row()
+        sub.scale_y = 0.6
+        sub.label(text="Saving at %d x %d" % (r.resolution_x, r.resolution_y))
+
+        lay.separator()
         lay.label(text="Frame shape", icon="IMAGE_PLANE")
         row = lay.row(align=True)
         for label, w, h in ASPECTS:

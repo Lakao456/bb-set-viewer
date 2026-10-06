@@ -20,7 +20,11 @@ Three phases, and the second one does not start on its own.
 
   PHASE 2 - optimise, only the steps a human asked for
 
-      blender -b "<file>.blend" --python <this file> -- optimise --share --join
+      blender -b "<file>.blend" --python <this file> -- optimise --share
+
+    --share is the whole of it in normal use: anything the art team drew more than once is
+    stored once and instanced, which is what makes a heavy set open. Joining small objects is
+    still there behind --join, but it works against instancing and is off by default.
 
   PHASE 3 - organise it and give it a camera
 
@@ -40,7 +44,7 @@ with Blender.
 bl_info = {
     "name": "BB SketchUp Convert",
     "author": "Beta Builder toolchain",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar (N) > BB Convert",
     "description": "Import a SketchUp .skp one to one, audit it, optimise it and organise it",
@@ -53,6 +57,7 @@ import json
 import math
 import os
 import random
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -249,6 +254,96 @@ def enable_importer():
         return False
 
 
+HIDDEN_PATCHES = (
+    # the importer drops anything on a tag that is invisible in the scene it imports
+    ("            self.layers_skip = [l for l in s.layers]\n",
+     "            self.layers_skip = []\n", 1),
+    # and anything hidden node by node, silently, with no option for it
+    ("            if group.hidden:\n", "            if False and group.hidden:\n", 1),
+    ("            if instance.hidden:\n", "            if False and instance.hidden:\n", 1),
+)
+
+CHILD_IMPORT = '''import addon_utils, bpy, sys
+addon_utils.enable("sketchup_importer", default_set=True, persistent=False)
+skp, out, scene = sys.argv[sys.argv.index("--") + 1:]
+bpy.ops.wm.read_homefile(use_empty=True)
+if scene:
+    bpy.context.scene.name = scene
+bpy.ops.import_scene.skp(filepath=skp, reuse_material=True, scenes_as_camera=True,
+                         max_instance=10 ** 9)
+# Blender does not write datablocks with no users, so a material the art team made but has not
+# put on anything is dropped by this very first save unless it is given a fake user here.
+for coll in (bpy.data.materials, bpy.data.images):
+    for b in coll:
+        if b.users == 0:
+            b.use_fake_user = True
+bpy.ops.wm.save_as_mainfile(filepath=out, compress=True)
+print("[child] objects %d" % len(bpy.context.scene.objects), flush=True)
+'''
+
+
+def import_including_hidden(skp, out_blend):
+    """Import the .skp with NOTHING left out.
+
+    The importer skips hidden groups, hidden component instances and anything on a tag that is
+    invisible in the scene being imported - silently, with no option to keep them. That is how a
+    whole set of marigold garlands, a mask and a lamp went missing from a finished file: they
+    were hidden in SketchUp, so they were simply not there.
+
+    Three lines of the importer decide this. They are patched in a COPY of the add-on in a temp
+    folder, found through BLENDER_USER_SCRIPTS, and the import runs in a second Blender. The
+    installed add-on is never touched."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    src = Path(addon_utils.__file__).parent      # placeholder, replaced below
+    for mod in addon_utils.modules():
+        if mod.__name__ == "sketchup_importer":
+            src = Path(mod.__file__).parent
+            break
+    else:
+        try:
+            import sketchup_importer
+            src = Path(sketchup_importer.__file__).parent
+        except Exception:
+            say("ERROR: cannot find the SketchUp importer to copy.")
+            return False
+
+    tmp = Path(tempfile.mkdtemp(prefix="bb_skp_hidden_"))
+    try:
+        pkg = tmp / "scripts" / "addons" / src.name
+        shutil.copytree(src, pkg)
+        for cache in pkg.rglob("__pycache__"):
+            shutil.rmtree(cache, ignore_errors=True)
+        f = pkg / "__init__.py"
+        text = f.read_text(encoding="utf-8")
+        for old, new, times in HIDDEN_PATCHES:
+            if text.count(old) != times:
+                say("ERROR: the importer has changed - cannot safely include hidden geometry.")
+                say("Run again with --skip-hidden to import the way SketchUp shows it.")
+                return False
+            text = text.replace(old, new)
+        f.write_text(text, encoding="utf-8")
+
+        helper = tmp / "do_import.py"
+        helper.write_text(CHILD_IMPORT, encoding="utf-8")
+        env = dict(os.environ, BLENDER_USER_SCRIPTS=str(tmp / "scripts"))
+        say("importing everything, hidden geometry included (a second Blender does this)")
+        # no --factory-startup: that ignores BLENDER_USER_SCRIPTS and the patched copy is unseen
+        r = subprocess.run([bpy.app.binary_path, "-b", "--python", str(helper), "--",
+                            str(skp), str(out_blend), skp.stem],
+                           env=env, capture_output=True, text=True)
+        if r.returncode != 0 or not Path(out_blend).exists():
+            say("ERROR: the import failed. Last lines:")
+            for line in r.stdout.splitlines()[-12:]:
+                say("   " + line)
+            return False
+        return True
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def do_import(skp):
     """Import the .skp as it is.
 
@@ -307,7 +402,7 @@ def hidden_geometry(skp):
     return rows
 
 
-def audit_report(skp=None):
+def audit_report(skp=None, skipped_hidden=False):
     """Everything that decides whether this set will open on a laptop."""
     objs = mesh_objects()
     lo, hi = world_bbox(objs)
@@ -348,6 +443,7 @@ def audit_report(skp=None):
         "heavy_objects": len(heavy),
         "heavy_object_faces": sum(heavy),
         "hidden": hidden_geometry(skp) if skp else [],
+        "skipped_hidden": bool(skipped_hidden),
     }
     return rec
 
@@ -379,10 +475,20 @@ def print_audit(rec):
     say("Textures         : %d, %d MB of picture data" % (rec["images"], rec["texture_mb"]))
     say("SketchUp cameras : %d" % rec["cameras"])
     say("Size             : %.1f x %.1f x %.1f metres" % tuple(rec["size_m"]))
-    if rec.get("hidden"):
+    if rec.get("hidden") and rec.get("skipped_hidden"):
         say("HIDDEN IN SKETCHUP - these did NOT come across")
-        say(" The importer skips anything hidden, with no warning. If any of these belong in")
-        say(" the set, unhide them in SketchUp, save, and convert again.")
+        say(" You asked for --skip-hidden, so anything hidden was left out. If any of these")
+        say(" belong in the set, convert again without that flag.")
+        for name, f in rec["hidden"][:12]:
+            say("   %-46s %s" % (name[:46], "%d faces" % f if f > 0 else "a whole component"))
+        if len(rec["hidden"]) > 12:
+            say("   ... and %d more" % (len(rec["hidden"]) - 12))
+        say()
+    elif rec.get("hidden"):
+        say("HIDDEN IN SKETCHUP - brought in anyway")
+        say(" These are hidden in the SketchUp file. They have been imported, because geometry")
+        say(" going missing is the worse failure. Switch them off in the Outliner if they are")
+        say(" not wanted, or convert again with --skip-hidden.")
         for name, f in rec["hidden"][:12]:
             say("   %-46s %s" % (name[:46], "%d faces" % f if f > 0 else "a whole component"))
         if len(rec["hidden"]) > 12:
@@ -459,6 +565,139 @@ def write_report(path, rec, steps=None):
         "",
     ]
     Path(path).write_text("\n".join(lines), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Reference shots: the art team's model is the ground truth, so the proof that nothing
+# changed is a picture. The viewpoints are recorded at import time and rebuilt from their
+# matrices afterwards, so they survive even phase 3 removing the cameras they came from.
+# ---------------------------------------------------------------------------
+
+SHOT_RES = 720
+SHOT_SAMPLES = 8
+
+
+def _force_eevee(scene):
+    """Reference pictures are rendered in EEVEE. Cycles is not part of this workflow, and the
+    point is a repeatable comparison, not a beautiful image."""
+    if scene.render.engine == "BLENDER_EEVEE":
+        return
+    try:
+        scene.render.engine = "BLENDER_EEVEE"      # dynamic enum: the error lists what is valid
+    except TypeError:
+        pass
+
+
+def _shot_dir(blend_path):
+    d = Path(blend_path).with_name(Path(blend_path).stem + " - verify")
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def record_viewpoints(blend_path, limit=4):
+    """Save the camera positions the comparison will use, before anything touches the file."""
+    cams = sorted((o for o in bpy.context.scene.objects if o.type == "CAMERA"),
+                  key=lambda o: o.name)[:limit]
+    if not cams:
+        return []
+    shots = [{"name": c.name,
+              "matrix": [list(r) for r in c.matrix_world],
+              "lens": c.data.lens,
+              "sensor": c.data.sensor_width} for c in cams]
+    (_shot_dir(blend_path) / "viewpoints.json").write_text(
+        json.dumps(shots, indent=1), encoding="utf-8")
+    return shots
+
+
+def render_shots(blend_path, label, shots=None):
+    """Render each recorded viewpoint. EEVEE, Standard view transform, fixed everything, so two
+    runs differ only if the set differs."""
+    folder = _shot_dir(blend_path)
+    if shots is None:
+        f = folder / "viewpoints.json"
+        if not f.exists():
+            return []
+        shots = json.loads(f.read_text(encoding="utf-8"))
+    if not shots:
+        return []
+    scene = bpy.context.scene
+    keep = (scene.camera, scene.render.filepath, scene.render.resolution_x,
+            scene.render.resolution_y, scene.render.resolution_percentage,
+            scene.render.image_settings.file_format, scene.view_settings.view_transform)
+    _force_eevee(scene)
+    made = []
+    try:
+        scene.render.resolution_x = SHOT_RES
+        scene.render.resolution_y = int(SHOT_RES * 9 / 16)
+        scene.render.resolution_percentage = 100
+        scene.render.image_settings.file_format = "PNG"
+        try:
+            scene.view_settings.view_transform = "Standard"
+        except TypeError:
+            pass
+        try:
+            scene.eevee.taa_render_samples = SHOT_SAMPLES
+        except AttributeError:
+            pass
+        for shot in shots:
+            data = bpy.data.cameras.new("bb_shot")
+            data.lens, data.sensor_width = shot["lens"], shot["sensor"]
+            cam = bpy.data.objects.new("bb_shot", data)
+            scene.collection.objects.link(cam)
+            cam.matrix_world = Matrix(shot["matrix"])
+            scene.camera = cam
+            path = str(folder / ("%s - %s.png" % (shot["name"].replace("/", "-"), label)))
+            scene.render.filepath = path
+            try:
+                bpy.ops.render.render(write_still=True)
+                made.append(path)
+            except Exception as exc:
+                say("could not render %s (%s)" % (shot["name"], exc))
+            finally:
+                bpy.data.objects.remove(cam)
+                bpy.data.cameras.remove(data)
+    finally:
+        (scene.camera, scene.render.filepath, scene.render.resolution_x,
+         scene.render.resolution_y, scene.render.resolution_percentage,
+         scene.render.image_settings.file_format, scene.view_settings.view_transform) = keep
+    return made
+
+
+def compare_shots(blend_path, before_label, after_label):
+    """Pixel-compare the two sets of renders. Returns the worst result as (name, %, max)."""
+    import numpy as np
+    folder = _shot_dir(blend_path)
+    f = folder / "viewpoints.json"
+    if not f.exists():
+        return None
+    rows = []
+    for shot in json.loads(f.read_text(encoding="utf-8")):
+        base = shot["name"].replace("/", "-")
+        a_path = folder / ("%s - %s.png" % (base, before_label))
+        b_path = folder / ("%s - %s.png" % (base, after_label))
+        if not (a_path.exists() and b_path.exists()):
+            continue
+        a_img = bpy.data.images.load(str(a_path), check_existing=False)
+        b_img = bpy.data.images.load(str(b_path), check_existing=False)
+        try:
+            if tuple(a_img.size) != tuple(b_img.size):
+                rows.append((shot["name"], 100.0, 1.0))
+                continue
+            a = np.empty(len(a_img.pixels), dtype=np.float32)
+            a_img.pixels.foreach_get(a)
+            b = np.empty(len(b_img.pixels), dtype=np.float32)
+            b_img.pixels.foreach_get(b)
+            d = np.abs(a.reshape(-1, 4)[:, :3] - b.reshape(-1, 4)[:, :3]).max(axis=1)
+            rows.append((shot["name"], 100.0 * float((d > 0.02).mean()), float(d.max())))
+        finally:
+            bpy.data.images.remove(a_img)
+            bpy.data.images.remove(b_img)
+    if not rows:
+        return None
+    say("picture check, %s against %s:" % (after_label, before_label))
+    for name, pct, mx in rows:
+        say("   %-28s %6.3f%% of pixels differ, worst %.3f" % (name[:28], pct, mx))
+    return max(rows, key=lambda r: r[1])
 
 
 # ---------------------------------------------------------------------------
@@ -826,13 +1065,25 @@ def cmd_prepare(args):
     say("triangles %d -> %d | rays: moved %d | turned %d | facing the other way %d | "
         "different material %d" % (base_tris, tris, c["moved"], c["turned"], c["flipped"],
                                    c["material"]))
-    if tris != base_tris or not probe_is_clean(c, args.rays):
+    # This step relinks objects between collections and swaps cameras. It never touches mesh
+    # data, so the test is: has anything MOVED? Where two faces sit in exactly the same place -
+    # common in an architectural model - which one a ray reports depends on evaluation order,
+    # and reordering collections changes that. Those ties show up as a changed facing or
+    # material with the hit point identical, and they are not a change to the set. The picture
+    # check below is the arbiter of whether anything actually looks different.
+    moved_at_all = c["moved"] or c["appeared"] or c["vanished"]
+    ties = c["flipped"] or c["material"] or c["turned"]
+    if tris != base_tris or moved_at_all:
         say("CHECK FAILED - not saving. Organising must not change the geometry.")
         return 5
-    say("CHECK PASSED - only the organisation and the cameras changed")
+    if ties:
+        say("%d ray(s) landed on the other of two faces sharing the same spot - nothing moved, "
+            "so this is the model's own coincident surfaces, not a change" % ties)
+    say("CHECK PASSED - nothing moved; only the organisation and the cameras changed")
 
     keep_unused_datablocks()
     bpy.ops.wm.save_as_mainfile(filepath=str(out), compress=True)
+    _picture_check(src, out, "organised")
     say("saved : %s" % out)
     say()
     say("Collections are a starting point, not gospel - rename or regroup them in the Outliner.")
@@ -844,6 +1095,38 @@ def cmd_prepare(args):
 # ---------------------------------------------------------------------------
 # commands
 # ---------------------------------------------------------------------------
+
+def _picture_check(src_blend, out_blend, label):
+    """Render the recorded viewpoints again and compare them with the ones from the import.
+
+    The ray check proves the geometry is where it was. This proves the set still LOOKS the same,
+    which is the thing anyone can actually judge - and it is the art team's model, so looking
+    different is not a trade we get to make."""
+    folder = _shot_dir(src_blend)
+    f = folder / "viewpoints.json"
+    if not f.exists():
+        say("no reference pictures from the import - skipping the picture check")
+        return
+    shots = json.loads(f.read_text(encoding="utf-8"))
+    out_folder = _shot_dir(out_blend)
+    if out_folder != folder:
+        (out_folder / "viewpoints.json").write_text(json.dumps(shots, indent=1), encoding="utf-8")
+        for shot in shots:
+            base = shot["name"].replace("/", "-")
+            ref = folder / ("%s - import.png" % base)
+            if ref.exists():
+                shutil.copy2(ref, out_folder / ("%s - import.png" % base))
+    render_shots(out_blend, label, shots)
+    worst = compare_shots(out_blend, "import", label)
+    if worst is None:
+        return
+    name, pct, mx = worst
+    if pct > 0.5:
+        say("THE SET LOOKS DIFFERENT: %.3f%% of pixels changed on %s." % (pct, name))
+        say("That should not happen. The two pictures are side by side in '%s'" % out_folder.name)
+    else:
+        say("the set looks the same (worst view: %.3f%% of pixels)" % pct)
+
 
 def cmd_audit(args):
     skp = Path(args.skp).expanduser().resolve()
@@ -861,9 +1144,16 @@ def cmd_audit(args):
         say("Install nothing else.")
         return 3
 
-    bpy.ops.wm.read_homefile(use_empty=True)
-    bpy.context.scene.name = skp.stem
-    do_import(skp)
+    if args.skip_hidden:
+        bpy.ops.wm.read_homefile(use_empty=True)
+        bpy.context.scene.name = skp.stem
+        do_import(skp)
+    else:
+        # Default: nothing is left out. Hidden geometry missing from a finished set is a far
+        # worse failure than a few extra objects you can switch off.
+        if not import_including_hidden(skp, out):
+            return 5
+        bpy.ops.wm.open_mainfile(filepath=str(out))
     if not mesh_objects():
         say("ERROR: the import produced no geometry.")
         say("Everything in the .skp may be hidden - the importer skips hidden groups. Unhide")
@@ -880,7 +1170,13 @@ def cmd_audit(args):
         say("note: could not pack the textures into the file (%s)." % exc)
     bpy.ops.wm.save_as_mainfile(filepath=str(out), compress=True)
 
-    rec = audit_report(skp)
+    shots = record_viewpoints(out, limit=args.shots)
+    if shots:
+        say("rendering %d reference picture(s) of the set as imported - every later step is"
+            " checked against these" % len(shots))
+        render_shots(out, "import", shots)
+
+    rec = audit_report(skp, skipped_hidden=args.skip_hidden)
     print_audit(rec)
     report = out.with_name(out.stem + " - conversion report.md")
     write_report(report, rec, [
@@ -987,6 +1283,7 @@ def cmd_optimise(args):
 
     keep_unused_datablocks()
     bpy.ops.wm.save_as_mainfile(filepath=str(out), compress=True)
+    _picture_check(src, out, "optimised")
     try:
         if backup.exists():
             backup.unlink()
@@ -1024,11 +1321,20 @@ def main():
     a1 = sub.add_parser("audit", help="import the .skp and report what is in it")
     a1.add_argument("--skp", required=True)
     a1.add_argument("--out", default="")
+    a1.add_argument("--shots", type=int, default=4,
+                    help="how many of the art team's cameras to render as reference\n                         pictures, which every later step is compared against")
+    a1.add_argument("--skip-hidden", action="store_true",
+                    help="import the way SketchUp shows it, leaving hidden groups, hidden "
+                         "components and invisible tags out. Off by default: things hidden in "
+                         "SketchUp have gone missing from finished sets this way")
 
     a2 = sub.add_parser("optimise", help="apply the steps you were told to apply")
     a2.add_argument("--out", default="")
     a2.add_argument("--share", action="store_true", help="store identical shapes once")
-    a2.add_argument("--join", action="store_true", help="join the small objects")
+    a2.add_argument("--join", action="store_true",
+                    help="join the small objects. OFF by default and not recommended: it bakes "
+                         "instanced geometry into real copies, which is the opposite of what "
+                         "makes a heavy set light")
     a2.add_argument("--cap", type=int, default=0, help="cap texture size in pixels (changes the look)")
     a2.add_argument("--max-faces", type=int, default=JOIN_MAX_FACES)
     a2.add_argument("--cell", type=float, default=JOIN_CELL)

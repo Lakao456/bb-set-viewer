@@ -27,7 +27,7 @@
       "id": "bb_set_viewer",
       "name": "BB Set Viewer",
       "tagline": "Game-style walk and one-panel camera for film set previs",
-      "version": "2.18.0",
+      "version": "2.20.0",
       "type": "add-on",
       "maintainer": "Lakao456",
       "license": [
@@ -42,16 +42,16 @@
         "3D View",
         "Camera"
       ],
-      "archive_url": "./bb_set_viewer-2.18.0.zip",
-      "archive_size": 34683,
-      "archive_hash": "sha256:e3b9db32b3a5aeaed08fe30cba345ab6c553d85a1ad26edeb0a1e3fbe4aed2eb"
+      "archive_url": "./bb_set_viewer-2.20.0.zip",
+      "archive_size": 36067,
+      "archive_hash": "sha256:263ce3706de481446c0080cb2d70f30e43ccc03821a63722d3eb12e2109666ee"
     },
     {
       "schema_version": "1.0.0",
       "id": "bb_skp_convert",
       "name": "BB SketchUp Convert",
       "tagline": "Import a SketchUp set one to one, then optimise and organise it",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "type": "add-on",
       "maintainer": "Lakao456",
       "license": [
@@ -65,9 +65,9 @@
       "tags": [
         "Import-Export"
       ],
-      "archive_url": "./bb_skp_convert-1.0.0.zip",
-      "archive_size": 15237,
-      "archive_hash": "sha256:4cba549c7db62d28633e5b84512a62654193966a25ef9b747e6c861f8af0d755"
+      "archive_url": "./bb_skp_convert-1.1.0.zip",
+      "archive_size": 19463,
+      "archive_hash": "sha256:4755ab29f3b0ee8c424b7f0c3be64e8943355b71783c0eed568cbe97b49334fb"
     },
     {
       "schema_version": "1.0.0",
