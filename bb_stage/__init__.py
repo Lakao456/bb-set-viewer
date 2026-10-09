@@ -22,7 +22,7 @@ from mathutils import Matrix, Quaternion, Vector
 bl_info = {
     "name": "BB Stage",
     "author": "Beta Builder",
-    "version": (0, 14, 0),
+    "version": (0, 14, 1),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > BB Stage",
     "category": "3D View",
@@ -3056,6 +3056,31 @@ class BBST_OT_cam_moves(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class BBST_OT_rename(bpy.types.Operator):
+    """Rename this camera"""
+    bl_idname = "bbst.rename"
+    bl_label = "Rename"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    obj_name: bpy.props.StringProperty()
+    new_name: bpy.props.StringProperty(name="Name")
+
+    def invoke(self, context, event):
+        self.new_name = self.obj_name
+        return context.window_manager.invoke_props_dialog(self, width=300)
+
+    def execute(self, context):
+        ob = bpy.data.objects.get(self.obj_name)
+        name = " ".join(self.new_name.split())
+        if ob is None or not name:
+            return {'CANCELLED'}
+        ob.name = name
+        if ob.type == 'CAMERA' and ob.data is not None:
+            ob.data.name = ob.name
+        request_sync(0.0)
+        return {'FINISHED'}
+
+
 class BBST_OT_cam_look(bpy.types.Operator):
     """Look through this camera in the clicked viewport"""
     bl_idname = "bbst.cam_look"
@@ -3451,6 +3476,8 @@ def sync_window(win, scene):
                     sh.color_type = ct
         if sh.show_xray:
             sh.show_xray = False
+        if role == "WORK" and not sp.overlay.show_extras:
+            sp.overlay.show_extras = True       # camera outlines in the plan, to see and click them
         if role.startswith("CAM"):
             cam = pane_camera(scene, role)
             if cam is not None:
@@ -4665,12 +4692,23 @@ class BBST_OT_walk(bpy.types.Operator):
             return {'PASS_THROUGH'}
         area = context.area
         region = next((r for r in area.regions if r.type == 'WINDOW'), None)   # the header button runs in HEADER
+        scene = context.scene
+        sp0 = area.spaces.active
+        pane_cam = sp0.camera if (sp0.use_local_camera and sp0.region_3d.view_perspective == 'CAMERA') else None
+        if pane_cam is not None:
+            _select_only(context, pane_cam)     # F in a camera pane works on that pane's camera
+        prev_cam = scene.camera
         try:
-            with context.temp_override(area=area, region=region):
-                bpy.ops.bb_sv.flythrough('INVOKE_DEFAULT')   # Set Viewer's walk flies the pane camera
+            if pane_cam is not None:
+                scene.camera = pane_cam         # Set Viewer's walk flies the scene camera; it keeps
+            with context.temp_override(area=area, region=region):     # its target once started
+                bpy.ops.bb_sv.flythrough('INVOKE_DEFAULT')
             return {'FINISHED'}
         except Exception:
             pass
+        finally:
+            if pane_cam is not None and prev_cam is not None and scene.camera != prev_cam:
+                scene.camera = prev_cam         # the playblast / beat-cut camera stays as it was
         sp = area.spaces.active
         was_locked = sp.lock_camera
         if sp.region_3d.view_perspective == 'CAMERA':
@@ -5537,7 +5575,10 @@ def draw_cams(lay, context):
     lay.operator("bbst.cam_add", icon='OUTLINER_OB_CAMERA')
     for ob in stage_cams(scene):
         row = lay.row(align=True)
-        row.prop(ob, "name", text="", emboss=True)
+        active = context.view_layer.objects.active == ob and ob.select_get()
+        op = row.operator("bbst.obj_action", text=ob.name, icon='OUTLINER_OB_CAMERA', depress=active)
+        op.obj_name, op.action = ob.name, 'SELECT'
+        row.operator("bbst.rename", text="", icon='GREASEPENCIL').obj_name = ob.name
         sub = row.row(align=True)
         sub.ui_units_x = 3
         sub.prop(ob.data, "bbst_lens_mm", text="")     # whole millimetres, like the pane header
@@ -5971,7 +6012,7 @@ CLASSES = [
     BBST_OT_beat_add, BBST_OT_beat_save, BBST_OT_beat_goto, BBST_OT_beat_delete,
     BBST_OT_play, BBST_OT_from_start, BBST_OT_step_beat,
     BBST_OT_fit_range, BBST_UL_beats,
-    BBST_OT_cam_add, BBST_OT_cam_moves, BBST_OT_cam_look, BBST_OT_cam_bind,
+    BBST_OT_cam_add, BBST_OT_cam_moves, BBST_OT_rename, BBST_OT_cam_look, BBST_OT_cam_bind,
     BBST_OT_pane_world, BBST_OT_pane_view, BBST_OT_pane_cam, BBST_OT_pane_lens,
     BBST_OT_lens_step, BBST_OT_pane_shading, BBST_OT_pan, BBST_OT_block, BBST_OT_block_easy,
     BBST_OT_mark_ceilings, BBST_OT_detect_floors, BBST_OT_fix_screen, BBST_OT_rebuild_shell,
