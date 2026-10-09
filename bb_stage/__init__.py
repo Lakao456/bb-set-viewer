@@ -22,7 +22,7 @@ from mathutils import Matrix, Quaternion, Vector
 bl_info = {
     "name": "BB Stage",
     "author": "Beta Builder",
-    "version": (0, 13, 1),
+    "version": (0, 14, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > BB Stage",
     "category": "3D View",
@@ -76,7 +76,7 @@ L1_COLL = "Upper floor — Level 1"
 SUB_KEY = "bb_st_sub"              # on STAGE sub-collections: Characters / Props / Cameras
 HOME_KEY = "bb_st_home"            # set object moved into a level collection: where it came from
 TINT_KEY = "bb_st_c0"              # ghost tint: the object's own colour, restored before saving
-DATA_VERSION = 8
+DATA_VERSION = 9
 EYE_HEIGHT = 1.6
 _QUIET = {"floor": False, "beats": False,     # floor: True while an upgrade sets play_level
           "dims": False, "carry": False}      # dims: a resize sets width and depth together
@@ -291,6 +291,8 @@ def migrate_staging(scene):
         for ob in coll_objects(c):
             if is_studio_floor(ob) and not all(ob.lock_location):
                 lock_floor(ob)
+    if st.data_version < 9:
+        st["use_floors"] = True         # stagings made before the switch were built on floors
     if st.data_version < DATA_VERSION:
         _QUIET["floor"] = True          # an upgrade must not re-detect the floor and move things
         try:
@@ -843,18 +845,27 @@ def follow_studio_space(scene):
     if b is None:
         return
     st = scene.bb_st
-    x, y = b.location.x, b.location.y
+    x, y, z = b.location.x, b.location.y, b.location.z
     if not st.bound_xy_set:
         st.bound_xy = (x, y)
+        st.bound_z = z
         st.bound_xy_set = True
         return
     dx, dy = x - st.bound_xy[0], y - st.bound_xy[1]
-    if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+    # with Floors off the studio's height is free (a city has no floors to snap to): a move up
+    # or down carries everything too. With Floors on the detected floor sets the height.
+    dz = 0.0 if st.use_floors else z - st.bound_z
+    if st.use_floors and abs(st.bound_z - z) > 1e-6:
+        st.bound_z = z
+    if abs(dx) < 1e-6 and abs(dy) < 1e-6 and abs(dz) < 1e-6:
         return
     _QUIET["carry"] = True
     try:
-        carry_with_studio(scene, Vector((dx, dy, 0.0)), skip_selected=True)
+        carry_with_studio(scene, Vector((dx, dy, dz)), skip_selected=True)
         st.bound_xy = (x, y)
+        if not st.use_floors:
+            st.bound_z = z
+            st.floor_z = z
     finally:
         _QUIET["carry"] = False
 
@@ -1413,6 +1424,27 @@ def _beat_index_update(self, context):
         scene.frame_set(st.beats[st.beat_index].frame)
 
 
+def _use_floors_update(self, context):
+    """Floors on: detect this set's floors (first time) and stand the studio on one, with levels
+    and the plan cut. Off: the studio stays where it is and moves freely, up and down too."""
+    scene = self.id_data
+    if not (isinstance(scene, bpy.types.Scene) and is_staging(scene)):
+        return
+    st = scene.bb_st
+    b = boundary_of(scene)
+    if st.use_floors:
+        fs = floor_state(scene)
+        if fs is not None and not floors_known(fs):
+            store_floors(fs, scene)
+        if b is not None:
+            refresh_floor(scene)
+            st.bound_z = b.location.z
+    elif b is not None:
+        st.bound_z = st.floor_z = b.location.z
+        st.active_level = 'ALL'
+    request_sync(0.0)
+
+
 def _play_level_update(self, context):
     """Settings › Plays on: the studio floor follows the level."""
     scene = self.id_data
@@ -1511,6 +1543,11 @@ class BBST_Props(bpy.types.PropertyGroup):
     needs_place: bpy.props.BoolProperty(default=False)
     bound_xy: bpy.props.FloatVectorProperty(size=2)      # where the studio space was: moves carry the rest
     bound_xy_set: bpy.props.BoolProperty(default=False)
+    bound_z: bpy.props.FloatProperty(default=0.0)
+    use_floors: bpy.props.BoolProperty(
+        name="Floors", default=False, update=_use_floors_update,
+        description="Detect the set's floors: levels, the plan cut and a studio that stands on a floor. "
+                    "Off (a city, an exterior): no floors are worked out and the studio moves freely, up and down too")
     # ---- v0.10: handles (file level, read from the set scene)
     artist_handles: bpy.props.BoolProperty(
         name="Easy handles in Artist Mode", default=False, update=_handles_update,
@@ -1678,6 +1715,10 @@ def studio_center(scene):
 def refresh_floor(scene, carry=True):
     st = scene.bb_st
     b = boundary_of(scene)
+    if not st.use_floors:           # no floors: the studio stands wherever its box is
+        if b is not None:
+            st.floor_z = b.location.z
+        return
     c = studio_center(scene)
     old = st.floor_z
     st.floor_z = detect_floor_z(scene, c.x, c.y, st.play_level)
@@ -1887,6 +1928,9 @@ class BBST_OT_new_staging(bpy.types.Operator):
     set_name: bpy.props.EnumProperty(name="Stage in", items=_set_scene_items,
                                      description="The set scene this staging plays in (Settings: which scenes are offered)")
     label: bpy.props.StringProperty(name="Staging name", default="")
+    use_floors: bpy.props.BoolProperty(name="Floors", default=False,
+                                       description="Work out the set's floors now (levels and plan cut). "
+                                                   "Can be switched on later in Settings")
     level: bpy.props.EnumProperty(name="Plays on", items=LEVEL_ITEMS, default='GROUND',
                                   description="Which floor this scene plays on — everything above it hides")
 
@@ -1900,9 +1944,10 @@ class BBST_OT_new_staging(bpy.types.Operator):
         lay = self.layout
         lay.prop(self, "set_name")
         lay.prop(self, "label")
+        lay.prop(self, "use_floors")
         src = bpy.data.scenes.get(self.set_name)
         fs = getattr(src, "bb_st", None)
-        if fs is None or not floors_known(fs) or fs.has_upper:
+        if self.use_floors and (fs is None or not floors_known(fs) or fs.has_upper):
             lay.prop(self, "level")
 
     def execute(self, context):
@@ -1946,14 +1991,22 @@ class BBST_OT_new_staging(bpy.types.Operator):
             subs[child] = c
         st.chars_coll, st.props_coll, st.cams_coll = subs["Characters"], subs["Props"], subs["Cameras"]
         fs = floor_state(sc)
-        if fs is not None and not floors_known(fs):
-            store_floors(fs, sc)        # first staging of this set scene: find its floors and plan cuts
-        level = self.level
+        st["use_floors"] = self.use_floors
+        if self.use_floors and fs is not None and not floors_known(fs):
+            store_floors(fs, sc)        # first floors staging of this set scene: find its floors and plan cuts
+        level = self.level if self.use_floors else 'GROUND'
+        if not self.use_floors:
+            st.active_level = "ALL"
         if level == 'L1' and fs is not None and not fs.has_upper:
             level = 'GROUND'
             self.report({'WARNING'}, "This set has one floor: the staging plays on the ground floor")
-        st.play_level = level
-        st.active_level = level
+        _QUIET["floor"] = True
+        try:
+            st.play_level = level
+        finally:
+            _QUIET["floor"] = False
+        if self.use_floors:
+            st.active_level = level
         st.data_version = DATA_VERSION
         # studio space: middle of the set, standing on this level's floor
         centre = set_bounds_center(sc)
@@ -1961,9 +2014,10 @@ class BBST_OT_new_staging(bpy.types.Operator):
         studio.objects.link(bound)
         st.boundary = bound
         bound.location = (centre.x, centre.y, 0.0)
-        st.floor_z = detect_floor_z(sc, centre.x, centre.y, level)
+        st.floor_z = detect_floor_z(sc, centre.x, centre.y, level) if self.use_floors else 0.0
         bound.location.z = st.floor_z
         st.bound_xy = (centre.x, centre.y)
+        st.bound_z = st.floor_z
         st.bound_xy_set = True
         build_studio_shell(sc)
         cam = make_stage_camera(sc)
@@ -2010,7 +2064,7 @@ class BBST_OT_staging_set(bpy.types.Operator):
         st = sc.bb_st
         sc.world = src.world
         fs = floor_state(sc)
-        if fs is not None and not floors_known(fs):
+        if st.use_floors and fs is not None and not floors_known(fs):
             store_floors(fs, sc)
         if st.play_level == 'L1' and fs is not None and not fs.has_upper:
             _QUIET["floor"] = True
@@ -3201,6 +3255,8 @@ def plan_cut(scene, space):
     """Section-cut height for the working pane, or None for no cut."""
     fs = floor_state(scene)
     st = scene.bb_st
+    if not st.use_floors:
+        return None             # no floors, no section cut: the whole model shows
     g, u = (fs.level1_cut, fs.ceiling_cut) if fs is not None else (5.5, 9.5)
     if st.active_level == 'GROUND':
         return g
@@ -3601,6 +3657,9 @@ class BBST_OT_pane_level(bpy.types.Operator):
         if not is_staging(context.scene):
             return {'CANCELLED'}
         fs = floor_state(context.scene)
+        if not context.scene.bb_st.use_floors:
+            self.report({'INFO'}, "Floors are off for this staging (Settings: Floors)")
+            return {'CANCELLED'}
         if self.level == 'L1' and fs is not None and not fs.has_upper:
             self.report({'WARNING'}, "This set has one floor (Settings: This set has an upper floor)")
             return {'CANCELLED'}
@@ -3666,8 +3725,9 @@ def _stage_header_draw(self, context):
             top = sp.region_3d.view_perspective == 'ORTHO'
             lay.operator("bbst.pane_view", text="Top-Down" if top else "3D",
                          icon='AXIS_TOP' if top else 'VIEW_PERSPECTIVE')
-            _dropdown(lay, 7, "bbst.pane_level", "level",
-                      dict((k, v) for k, v, _d in LEVEL_ITEMS)[st.active_level], icon='CON_FLOOR')
+            if st.use_floors:
+                _dropdown(lay, 7, "bbst.pane_level", "level",
+                          dict((k, v) for k, v, _d in LEVEL_ITEMS)[st.active_level], icon='CON_FLOOR')
             lay.separator_spacer()
             _draw_world_shading(lay, context, role or "WORK")
             lay.separator_spacer()
@@ -4342,6 +4402,11 @@ class BBST_GGT_handles(bpy.types.GizmoGroup):
         c = Vector((b.location.x, b.location.y, st.floor_z))
         self.move.matrix_basis = Matrix.Translation(c) @ rot
         self.move.hide = False
+        if not st.use_floors:           # no floors: lift and lower the studio too
+            for pl in ("XZ", "YZ"):
+                gz = self.planes[pl]
+                gz.matrix_basis = Matrix.Translation(c) @ _plane_matrix(pl)
+                gz.hide = False
         hw, hd = st.studio_w / 2, st.studio_d / 2
         for key, (sx, sy) in _RESIZE.items():
             p = c + rot.to_3x3() @ Vector((sx * hw, sy * hd, 0.0))
@@ -5518,15 +5583,19 @@ def draw_settings(lay, context):
     col = lay.column(align=True)
     src = set_scene_of(context.scene)
     ff = floor_state(context.scene)
-    col.label(text=f"Floors of {src.name if src else 'this set'}:")
-    if ff is not None:
-        col.prop(ff, "level1_cut", text="Ground floor plan cut (m)")
-        col.prop(ff, "ceiling_cut", text="Upper floor plan cut (m)")
-        col.prop(ff, "has_upper")
-    col.operator("bbst.detect_floors", icon='VIEWZOOM')
-    col = lay.column(align=True)
-    col.prop(st, "play_level")
-    col.prop(st, "floor_z")
+    col.prop(st, "use_floors", text="Floors (levels and plan cut)", toggle=True, icon='CON_FLOOR')
+    if st.use_floors:
+        col.label(text=f"Floors of {src.name if src else 'this set'}:")
+        if ff is not None:
+            col.prop(ff, "level1_cut", text="Ground floor plan cut (m)")
+            col.prop(ff, "ceiling_cut", text="Upper floor plan cut (m)")
+            col.prop(ff, "has_upper")
+        col.operator("bbst.detect_floors", icon='VIEWZOOM')
+        col = lay.column(align=True)
+        col.prop(st, "play_level")
+        col.prop(st, "floor_z")
+    else:
+        col.label(text="Off: move the studio box anywhere, up and down too", icon='INFO')
     col = lay.column(align=True)
     col.label(text="Set scenes offered in New Staging:")
     for sc in set_scenes(offered=False):
