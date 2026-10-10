@@ -1,0 +1,12 @@
+schema_version = "1.0.0"
+
+id = "bb_crowd"
+version = "0.4.1"
+name = "BB Crowd"
+tagline = "Procedural crowds for blocking: controllers and character fields"
+maintainer = "Lakao456"
+type = "add-on"
+website = "https://github.com/Lakao456/bb-set-viewer"
+tags = ["3D View", "Animation"]
+blender_version_min = "5.0.0"
+license = ["SPDX:GPL-2.0-or-later"]

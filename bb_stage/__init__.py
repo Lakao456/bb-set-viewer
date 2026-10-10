@@ -22,7 +22,7 @@ from mathutils import Matrix, Quaternion, Vector
 bl_info = {
     "name": "BB Stage",
     "author": "Beta Builder",
-    "version": (0, 14, 1),
+    "version": (0, 15, 1),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > BB Stage",
     "category": "3D View",
@@ -78,6 +78,8 @@ HOME_KEY = "bb_st_home"            # set object moved into a level collection: w
 TINT_KEY = "bb_st_c0"              # ghost tint: the object's own colour, restored before saving
 DATA_VERSION = 9
 EYE_HEIGHT = 1.6
+HUMAN_MAX_SPEED = 4.0          # m/s between beats: a sprint; above it the beat panel turns red (Aman, 10 Oct 2026)
+PEG_MESH_VERSION = 2           # 2: no base disc (Aman, 10 Oct 2026: the disc made characters look bigger)
 _QUIET = {"floor": False, "beats": False,     # floor: True while an upgrade sets play_level
           "dims": False, "carry": False}      # dims: a resize sets width and depth together
 WORLD_ITEMS = [('STUDIO', "Studio", "The grey studio blockout"),
@@ -434,6 +436,8 @@ def sync_peg_colors(scene):
             continue
         if ob.data.users > 1:
             ob.data = ob.data.copy()
+        if ob.get(ROLE_KEY) == "char" and ob.data.get("bbst_peg") != PEG_MESH_VERSION and ob.mode == 'OBJECT':
+            refresh_peg_mesh(ob)        # pegs made before 0.15 still carry the base disc
         mat = _peg_mat(ob)
         if mat is None or mat.users > 1 or not mat.name.startswith("BB Peg"):
             peg_material(ob)            # writes the colour too
@@ -445,16 +449,13 @@ def sync_peg_colors(scene):
             bsdf.inputs['Base Color'].default_value = tuple(ob.color)
 
 
-def build_peg_object(name, height=1.75, color=(0.8, 0.2, 0.2, 1.0)):
+def peg_bmesh(height=1.75):
+    """The peg: a body cylinder, a head and a nose on +Y. No base disc since 0.15 (it read as the
+    character's footprint and made everyone look bigger than they are)."""
     bm = bmesh.new()
     r = 0.13 * height / 1.75                 # body radius
     body_h = height * 0.80
     head_r = height * 0.075
-    # base disc + direction wedge, so the character reads as a solid dot in the plan view
-    mat = Matrix.Translation((0, 0, 0.012)) @ Matrix.Diagonal((0.34, 0.34, 0.012)).to_4x4()
-    bmesh.ops.create_cone(bm, cap_ends=True, segments=20, radius1=1, radius2=1, depth=2, matrix=mat)
-    mat = Matrix.Translation((0, 0.42, 0.012)) @ Matrix.Diagonal((0.10, 0.12, 0.012)).to_4x4()
-    bmesh.ops.create_cone(bm, cap_ends=True, segments=3, radius1=1, radius2=0.15, depth=2, matrix=mat)
     # body: cylinder from floor to shoulders
     mat = Matrix.Translation((0, 0, body_h / 2)) @ Matrix.Diagonal((r, r, body_h / 2)).to_4x4()
     bmesh.ops.create_cone(bm, cap_ends=True, segments=16, radius1=1, radius2=0.85, depth=2, matrix=mat)
@@ -466,10 +467,41 @@ def build_peg_object(name, height=1.75, color=(0.8, 0.2, 0.2, 1.0)):
            @ Matrix.Rotation(-math.pi / 2, 4, 'X')
            @ Matrix.Diagonal((head_r * 0.45, head_r * 0.45, head_r * 0.9)).to_4x4())
     bmesh.ops.create_cone(bm, cap_ends=True, segments=10, radius1=1, radius2=0.0, depth=1.2, matrix=mat)
+    return bm
+
+
+def peg_height_of(ob):
+    h = ob.get("bbst_height")
+    if h:
+        return float(h)
+    try:
+        top = max(v.co.z for v in ob.data.vertices)
+        return top / 0.9575 if top > 0.3 else 1.75     # body 0.80 h + head 2.1 × 0.075 h
+    except Exception:
+        return 1.75
+
+
+def refresh_peg_mesh(ob):
+    """Rebuild a character's mesh in place to the current peg design (keeps the object, its colour and keys)."""
+    if ob.type != 'MESH' or ob.data is None:
+        return
+    h = peg_height_of(ob)
+    bm = peg_bmesh(h)
+    bm.to_mesh(ob.data)
+    bm.free()
+    ob.data["bbst_peg"] = PEG_MESH_VERSION
+    ob["bbst_height"] = h
+    ob.data.update()
+
+
+def build_peg_object(name, height=1.75, color=(0.8, 0.2, 0.2, 1.0)):
+    bm = peg_bmesh(height)
     me = bpy.data.meshes.new(name)
     bm.to_mesh(me)
     bm.free()
+    me["bbst_peg"] = PEG_MESH_VERSION
     ob = bpy.data.objects.new(name, me)
+    ob["bbst_height"] = height
     ob.color = color
     ob[ROLE_KEY] = "char"
     ob.show_name = True
@@ -890,6 +922,34 @@ def floor_selects_space(scene, view_layer):
         view_layer.objects.active = b
 
 
+def preview_follow(scene):
+    """The preview pane shows the scene camera. Panes are in local view, and Blender does not sync a
+    local-view pane's camera to scene.camera (the marker cuts), so this copies it over on every frame."""
+    cam = scene.camera
+    if cam is None:
+        return
+    for win in stage_windows():
+        if win.scene != scene:
+            continue
+        a = stage_panes(win).get("CAM0")
+        if a is None:
+            continue
+        sp = a.spaces.active
+        if not sp.use_local_camera:
+            sp.use_local_camera = True
+        if sp.camera != cam:
+            sp.camera = cam
+            a.tag_redraw()
+
+
+def _bbst_on_frame(scene):
+    try:
+        if scene is not None and is_staging(scene):
+            preview_follow(scene)
+    except Exception as e:
+        print("BB Stage preview:", e)
+
+
 def _bbst_on_depsgraph(scene, depsgraph):
     """Mark the beat at the playhead orange when a staged object moves off its saved keys."""
     if scene is not None and is_staging(scene) and not _QUIET["carry"]:
@@ -1039,6 +1099,36 @@ def keyed_location_at(ob, frame):
         if fc.data_path == "location" and 0 <= fc.array_index < 3:
             loc[fc.array_index] = fc.evaluate(frame)
     return loc
+
+
+def keyed_rotation_at(ob, frame):
+    rot = ob.rotation_euler.copy()
+    ad = ob.animation_data
+    for fc in (channelbag_fcurves(ad.action) if ad and ad.action else []):
+        if fc.data_path == "rotation_euler" and 0 <= fc.array_index < 3:
+            rot[fc.array_index] = fc.evaluate(frame)
+    return rot
+
+
+def reset_to_keys(scene, obs=None, frame=None):
+    """Put staged objects back where their beat keys hold them on this frame: unsaved moves are dropped
+    (Aman, 10 Oct 2026). Returns how many moved."""
+    f = scene.frame_current if frame is None else frame
+    n = 0
+    for ob in (obs if obs is not None else keyed_objects(scene)):
+        ad = ob.animation_data
+        if not (ad and ad.action):
+            continue
+        loc, rot = keyed_location_at(ob, f), keyed_rotation_at(ob, f)
+        if (loc - ob.location).length > 1e-5 or any(abs(a - b) > 1e-5 for a, b in zip(rot, ob.rotation_euler)):
+            ob.location, ob.rotation_euler = loc, rot
+            n += 1
+    st = getattr(scene, "bb_st", None)
+    if st is not None and obs is None:
+        i = beat_at_frame(scene)
+        if i is not None:
+            st.beats[i].dirty = False
+    return n
 
 
 def path_window(st, i):
@@ -2485,13 +2575,17 @@ class BBST_OT_obj_action(bpy.types.Operator):
     obj_name: bpy.props.StringProperty()
     action: bpy.props.EnumProperty(items=[
         ('SELECT', "Select", ""), ('LOCK', "Lock", ""), ('DELETE', "Delete", ""),
-        ('EYE', "Eyeline", ""), ('FLOOR', "Drop to floor", "")])
+        ('EYE', "Eyeline", ""), ('FLOOR', "Drop to floor", ""),
+        ('RESET', "Reset to keys", "Back to where the saved beats hold it on this frame")])
 
     def execute(self, context):
         ob = bpy.data.objects.get(self.obj_name)
         if not ob:
             return {'CANCELLED'}
-        if self.action == 'SELECT':
+        if self.action == 'RESET':
+            reset_to_keys(context.scene, [ob])
+            request_sync(0.0)
+        elif self.action == 'SELECT':
             for sel in context.selected_objects:
                 sel.select_set(False)
             ob.select_set(True)
@@ -2553,11 +2647,61 @@ class BBST_UL_objects(bpy.types.UIList):
         if ob.get(ROLE_KEY) == "char":
             op = row.operator("bbst.obj_action", text="", icon='USER')   # eyeline: look as this character
             op.obj_name = ob.name; op.action = 'EYE'
+        op = row.operator("bbst.obj_action", text="", icon='LOOP_BACK')  # back to the saved keys
+        op.obj_name = ob.name; op.action = 'RESET'
         op = row.operator("bbst.obj_action", text="", icon='X')
         op.obj_name = ob.name; op.action = 'DELETE'
 
 
 # ------------------------------------------------------------------ beats operators
+
+class BBST_OT_reset_moves(bpy.types.Operator):
+    """Drop every unsaved move: everyone goes back to where the saved beats hold them on this frame"""
+    bl_idname = "bbst.reset_moves"
+    bl_label = "Reset Moves"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        n = reset_to_keys(context.scene)
+        self.report({'INFO'}, f"{n} object(s) back on their keys" if n else "Nothing had moved")
+        request_sync(0.0)
+        return {'FINISHED'}
+
+
+class BBST_OT_beat_insert(bpy.types.Operator):
+    """Insert a beat right after the active one, saving everyone's current positions to it (the move into the next beat is split in two)"""
+    bl_idname = "bbst.beat_insert"
+    bl_label = "Insert Beat After"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        st = scene.bb_st
+        if not st.beats:
+            return bpy.ops.bbst.beat_add()
+        i = _clamped_beat(st)
+        if i >= len(st.beats) - 1:
+            return bpy.ops.bbst.beat_add()      # after the last one: a plain Add
+        nxt_move = st.beats[i + 1].move_s
+        bpy.ops.bbst.beat_add()                 # keys the current arrangement on a new last beat
+        last = len(st.beats) - 1
+        _QUIET["beats"] = True
+        try:
+            poses = sample_beat_poses(scene)    # per beat, at the frames the keys sit on right now
+            st.beats.move(last, i + 1)
+            for name in poses:
+                poses[name].insert(i + 1, poses[name].pop(last))
+            half = max(0.5, round(nxt_move / 2.0, 1))
+            st.beats[i + 1].move_s = half
+            st.beats[i + 1].hold_s = 0.0
+            st.beats[i + 2].move_s = max(0.5, round(nxt_move - half, 1))
+            ensure_beat_uids(scene)
+            write_beat_layout(scene, poses)
+        finally:
+            _QUIET["beats"] = False
+        st.beat_index = i + 1
+        scene.frame_set(st.beats[i + 1].frame)
+        return {'FINISHED'}
 
 class BBST_OT_beat_add(bpy.types.Operator):
     """Add a beat after the last one and save everyone's positions to it"""
@@ -3100,7 +3244,7 @@ class BBST_OT_cam_look(bpy.types.Operator):
 
 
 class BBST_OT_cam_bind(bpy.types.Operator):
-    """Cut to this camera at the active beat during playback"""
+    """Cut to this camera at the active beat during playback (0.14 and earlier; cuts now live on the timeline)"""
     bl_idname = "bbst.cam_bind"
     bl_label = "Cut Here at Beat"
     cam_name: bpy.props.StringProperty()
@@ -3112,9 +3256,84 @@ class BBST_OT_cam_bind(bpy.types.Operator):
         if not (ob and st.beats):
             return {'CANCELLED'}
         b = st.beats[_clamped_beat(st)]
-        for m in scene.timeline_markers:
-            if m.frame == b.frame:
-                m.camera = ob
+        set_cut(scene, b.frame, ob)
+        return {'FINISHED'}
+
+
+# ------------------------------------------------------------------ camera cuts (0.15)
+#
+# Aman, 10 Oct 2026: cuts are not tied to beats. A cut is a timeline marker bound to a camera, placed at any
+# frame from the preview pane (or Ctrl+B in the timeline) and dragged around on the timeline like any marker.
+# Blender switches the scene camera at the markers; the preview pane follows the scene camera.
+
+CUT_PREFIX = "CUT "
+
+
+def cut_markers(scene):
+    return [m for m in scene.timeline_markers if m.camera is not None]
+
+
+def cut_at(scene, frame):
+    """The cut marker sitting exactly on this frame, if any."""
+    return next((m for m in scene.timeline_markers if m.frame == frame and m.camera is not None), None)
+
+
+def set_cut(scene, frame, cam):
+    """Cut to cam at this frame: reuse a marker already on the frame (a beat marker keeps its name)."""
+    here = [m for m in scene.timeline_markers if m.frame == frame]
+    target = next((m for m in here if m.camera is not None), None) or next((m for m in here if not m.name.startswith("B")), None)
+    if target is None:
+        target = scene.timeline_markers.new(f"{CUT_PREFIX}{cam.name}", frame=frame)
+    for m in here:
+        if m is not target and m.camera is not None:
+            m.camera = None
+    target.camera = cam
+    if target.name.startswith(CUT_PREFIX):
+        target.name = f"{CUT_PREFIX}{cam.name}"
+    scene.frame_set(scene.frame_current)       # Blender applies the marker cameras on a frame change
+    return target
+
+
+def remove_cut(scene, frame):
+    for m in [m for m in scene.timeline_markers if m.frame == frame and m.camera is not None]:
+        if m.name.startswith(CUT_PREFIX):
+            scene.timeline_markers.remove(m)
+        else:
+            m.camera = None             # a beat marker stays, only its cut goes
+    scene.frame_set(scene.frame_current)
+
+
+class BBST_OT_cut_here(bpy.types.Operator):
+    """Cut to this camera from the current frame on (a marker on the timeline; drag it to move the cut)"""
+    bl_idname = "bbst.cut_here"
+    bl_label = "Add Camera Cut"
+    bl_options = {'REGISTER', 'UNDO'}
+    cam: bpy.props.EnumProperty(items=lambda self, ctx: _cam_enum_items(self, ctx))   # defined further down
+
+    def execute(self, context):
+        scene = context.scene
+        ob = bpy.data.objects.get(self.cam)
+        if not (ob and is_staging(scene)):
+            return {'CANCELLED'}
+        set_cut(scene, scene.frame_current, ob)
+        for a in context.screen.areas:
+            a.tag_redraw()
+        return {'FINISHED'}
+
+
+class BBST_OT_cut_remove(bpy.types.Operator):
+    """Remove the camera cut on the current frame"""
+    bl_idname = "bbst.cut_remove"
+    bl_label = "Remove Camera Cut"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        if cut_at(scene, scene.frame_current) is None:
+            return {'CANCELLED'}
+        remove_cut(scene, scene.frame_current)
+        for a in context.screen.areas:
+            a.tag_redraw()
         return {'FINISHED'}
 
 
@@ -3478,7 +3697,25 @@ def sync_window(win, scene):
             sh.show_xray = False
         if role == "WORK" and not sp.overlay.show_extras:
             sp.overlay.show_extras = True       # camera outlines in the plan, to see and click them
-        if role.startswith("CAM"):
+        if role == "CAM0":
+            # the preview follows the scene camera (the camera cuts on the timeline switch it)
+            if scene.camera is None:
+                cams = stage_cams(scene)
+                if cams:
+                    scene.camera = cams[0]
+            if not sp.use_local_camera:
+                sp.use_local_camera = True
+            if scene.camera is not None and sp.camera != scene.camera:
+                sp.camera = scene.camera
+            if sp.region_3d.view_perspective != 'CAMERA':
+                sp.region_3d.view_perspective = 'CAMERA'
+            if sp.lock_camera:
+                sp.lock_camera = False
+            if sp.show_gizmo:
+                sp.show_gizmo = False
+            if sp.region_3d.use_clip_planes:
+                sp.region_3d.use_clip_planes = False
+        elif role.startswith("CAM"):
             cam = pane_camera(scene, role)
             if cam is not None:
                 if not sp.use_local_camera:
@@ -3732,7 +3969,26 @@ def _stage_header_draw(self, context):
         scene = context.scene
         st = scene.bb_st
         role = pane_role(context.window, context.area)
-        if role and role.startswith("CAM"):
+        if role == "CAM0":
+            # the preview: what the cuts show at this frame; a cut can be placed or removed here
+            cams = stage_cams(scene)
+            if not cams:
+                lay.operator("bbst.cam_add", text="Add Camera", icon='ADD')
+            else:
+                cut = cut_at(scene, scene.frame_current)
+                showing = scene.camera.name if scene.camera is not None else "—"
+                lay.label(text=f"Preview · {showing}", icon='SEQUENCE')
+                _dropdown(lay, 8, "bbst.cut_here", "cam",
+                          f"Cut here: {cut.camera.name}" if (cut is not None and cut.camera) else "Add camera cut",
+                          icon='MARKER_HLT')
+                sub = lay.row(align=True)
+                sub.enabled = cut is not None
+                sub.operator("bbst.cut_remove", text="", icon='X')
+            lay.separator_spacer()
+            _draw_world_shading(lay, context, role)
+            lay.separator_spacer()
+            lay.label(text="cuts live on the timeline below", icon='INFO')
+        elif role and role.startswith("CAM"):
             cam = pane_camera(scene, role)
             if cam is None:      # empty state: the way to a camera, not a dead dropdown
                 lay.operator("bbst.cam_add", text="Add Camera", icon='ADD')
@@ -4138,7 +4394,13 @@ def _build_stage_screen(scene_name):
                 for a in screen.areas:     # build in Solid: a Material Preview redraw per tick is slow
                     if a.type == 'VIEW_3D' and a.spaces.active.shading.type not in ('SOLID', 'WIREFRAME'):
                         a.spaces.active.shading.type = 'SOLID'
-                victim = next((a for a in screen.areas if a.type != 'VIEW_3D'), None)
+                # target (0.15): three 3D views + one timeline under the preview (top-left)
+                timelines = [a for a in screen.areas if _is_timeline_area(a)]
+                victim = next((a for a in screen.areas if a.type != 'VIEW_3D' and not _is_timeline_area(a)), None)
+                if victim is None and len(timelines) > 1:
+                    victim = min(timelines, key=lambda a: a.width * a.height)
+                if victim is None and timelines and timelines[0].width > 0.6 * win.width:
+                    victim = timelines[0]       # a full-width timeline (Blender's Layout): ours goes under the preview
                 if victim is not None:
                     try:
                         with ctx.temp_override(window=win, screen=screen, area=victim):
@@ -4147,6 +4409,13 @@ def _build_stage_screen(scene_name):
                         victim.ui_type = 'VIEW_3D'
                     return 0.05
                 v3 = [a for a in screen.areas if a.type == 'VIEW_3D']
+                if len(v3) == 4 and not timelines:
+                    # the preview pane was just split: the middle piece of the left column becomes the timeline
+                    work = max(v3, key=lambda a: (a.x + a.width, a.width * a.height))
+                    left = sorted([a for a in v3 if a != work], key=lambda a: -a.y)
+                    if len(left) == 3:
+                        left[1].ui_type = 'TIMELINE'
+                        return 0.05
                 if len(v3) > 3:
                     smallest = min(v3, key=lambda a: a.width * a.height)
                     try:
@@ -4164,6 +4433,12 @@ def _build_stage_screen(scene_name):
                     with ctx.temp_override(window=win, screen=screen, area=left):
                         bpy.ops.screen.area_split(direction='HORIZONTAL', factor=0.5)
                     return 0.05
+                if len(v3) == 3 and not timelines:
+                    preview = stage_panes(win).get("CAM0")
+                    if preview is not None and preview.height > 240:
+                        with ctx.temp_override(window=win, screen=screen, area=preview):
+                            bpy.ops.screen.area_split(direction='HORIZONTAL', factor=0.28)
+                        return 0.05
             _configure_stage_panes(scene_name, win)
         except Exception as e:
             import traceback
@@ -4535,19 +4810,65 @@ def apply_mode_tool(win):
         pass
 
 
+def _is_timeline_area(area):
+    try:
+        return area.type == 'DOPESHEET_EDITOR' and area.ui_type == 'TIMELINE'
+    except Exception:
+        return False
+
+
+def timeline_area(window):
+    """The timeline under the preview pane (0.15), if the screen has one."""
+    if window is None or window.screen is None:
+        return None
+    tl = [a for a in window.screen.areas if _is_timeline_area(a)]
+    return min(tl, key=lambda a: a.x) if tl else None
+
+
+def _configure_timeline(win, area):
+    area.show_menus = False
+    sp = area.spaces.active
+    try:
+        sp.show_region_ui = False
+        sp.show_region_channels = False
+    except Exception:
+        pass
+    try:
+        sp.show_markers = True
+        sp.show_seconds = False
+        sp.dopesheet.show_only_selected = False
+    except Exception:
+        pass
+
+
 def _configure_stage_panes(scene_name, win):
     # the window's own staging wins: a build scheduled earlier must not undo a newer switch
     scene = win.scene if is_staging(win.scene) else (bpy.data.scenes.get(scene_name) or win.scene)
     if win.scene != scene and is_staging(scene):
         win.scene = scene
     roles = stage_panes(win)
+    tl = timeline_area(win)
+    if tl is not None:
+        _configure_timeline(win, tl)
     for role, a in roles.items():
         a.show_menus = False
         sp = a.spaces.active
         if getattr(sp, "use_local_collections", False):
             sp.use_local_collections = False
         _declutter(sp, names=(role == "WORK"), sidebar=(role == "WORK"))
-        if role.startswith("CAM"):
+        if role == "CAM0":
+            # the preview: the scene camera, which the cut markers switch; nothing is edited here.
+            # A pane in local view never follows scene.camera on its own, so the pane carries its
+            # own camera pointer and the frame handler keeps it equal to the scene camera.
+            sp.lock_camera = False
+            sp.use_local_camera = True
+            if scene.camera is not None and sp.camera != scene.camera:
+                sp.camera = scene.camera
+            sp.show_gizmo = False
+            if sp.region_3d.view_perspective != 'CAMERA':
+                sp.region_3d.view_perspective = 'CAMERA'
+            _flip_header_to_bottom(win, a)
+        elif role.startswith("CAM"):
             sp.lock_camera = False
             _flip_header_to_bottom(win, a)
         else:
@@ -4596,7 +4917,11 @@ def _panes_drifted(win):
         sp = a.spaces.active
         if sp.local_view is None:
             return True
-        if role.startswith("CAM"):
+        if role == "CAM0":
+            if (not sp.use_local_camera or sp.region_3d.view_perspective != 'CAMERA'
+                    or (scene.camera is not None and sp.camera != scene.camera)):
+                return True
+        elif role.startswith("CAM"):
             cam = pane_camera(scene, role)
             if cam is not None and (sp.camera != cam or not sp.use_local_camera
                                     or sp.region_3d.view_perspective != 'CAMERA'):
@@ -4690,6 +5015,9 @@ class BBST_OT_walk(bpy.types.Operator):
     def invoke(self, context, event):
         if not (_in_stage(context) and context.area and context.area.type == 'VIEW_3D'):
             return {'PASS_THROUGH'}
+        if pane_role(context.window, context.area) == "CAM0":
+            self.report({'INFO'}, "The preview only watches: frame cameras in the pane below")
+            return {'CANCELLED'}
         area = context.area
         region = next((r for r in area.regions if r.type == 'WINDOW'), None)   # the header button runs in HEADER
         scene = context.scene
@@ -5136,7 +5464,7 @@ class BBST_OT_playblast(bpy.types.Operator):
     bl_idname = "bbst.playblast"
     bl_label = "Playblast"
     cam_name: bpy.props.StringProperty()
-    use_cuts: bpy.props.BoolProperty(name="Follow beat camera cuts", default=False)
+    use_cuts: bpy.props.BoolProperty(name="Follow the camera cuts", default=False)
 
     def execute(self, context):
         scene = context.scene
@@ -5150,6 +5478,8 @@ class BBST_OT_playblast(bpy.types.Operator):
         area = (next((a for a in cam_panes if a.spaces.active.use_local_camera
                       and a.spaces.active.camera == cam), None)
                 or (cam_panes[0] if cam_panes else None) or view3d_area(context))
+        if self.use_cuts and "CAM0" in roles:
+            area = roles["CAM0"]        # the preview: the frame handler feeds it the cut camera per frame
         if area is None:
             self.report({'ERROR'}, "No 3D view to render from")
             return {'CANCELLED'}
@@ -5175,8 +5505,8 @@ class BBST_OT_playblast(bpy.types.Operator):
                 for mk, _c in saved_binds:
                     mk.camera = None   # a bound beat camera would hijack a per-camera playblast
             scene.camera = cam
-            if self.use_cuts or space.camera != cam:
-                space.use_local_camera = False   # follow scene.camera (for the Edit: the beat cuts)
+            space.use_local_camera = True        # a local-view pane never follows scene.camera by itself:
+            space.camera = cam                   # the frame handler re-points it at every cut
             rv3d.view_perspective = 'CAMERA'
             if st is not None and st.beats:      # the beats, not the whole scene range
                 scene.frame_start = st.beats[0].frame
@@ -5533,6 +5863,13 @@ def draw_beats(lay, context):
     sub = row.row(align=True)
     sub.enabled = n > 0
     sub.operator("bbst.beat_save", icon='STRIP_COLOR_02' if (n > 0 and st.beats[idx].dirty) else 'KEYINGSET')
+    row = lay.row(align=True)
+    sub = row.row(align=True)
+    sub.enabled = n > 0
+    sub.operator("bbst.beat_insert", text="Insert After", icon='NODE_INSERT_ON')
+    sub = row.row(align=True)
+    sub.enabled = n > 0 and st.beats[idx].dirty
+    sub.operator("bbst.reset_moves", text="Reset Moves", icon='LOOP_BACK')
     grid = lay.grid_flow(row_major=True, columns=5, even_columns=True, align=True)
     grid.scale_y = 1.3
     grid.operator("bbst.beat_goto", text="", icon='REW').index = 0
@@ -5563,8 +5900,14 @@ def draw_beats(lay, context):
             lay.label(text=f"Total: {total:.1f} s{warn}", icon='TIME')
             top = beat_top_speed(scene, idx)
             if top and top[1] > 0.05:
-                lay.label(text=f"Fastest to next beat: {top[0]} {top[1]:.1f} m/s",
-                          icon='ERROR' if top[1] > 1.6 else 'CHECKMARK')
+                r = lay.row()
+                if top[1] > HUMAN_MAX_SPEED:
+                    r.alert = True       # red: nobody moves that fast; fine for a previz, but know it
+                    r.label(text=f"{top[0]} {top[1]:.1f} m/s to next beat — beyond human", icon='ERROR')
+                elif top[1] > 1.6:
+                    r.label(text=f"{top[0]} {top[1]:.1f} m/s to next beat — running", icon='ERROR')
+                else:
+                    r.label(text=f"Fastest to next beat: {top[0]} {top[1]:.1f} m/s", icon='CHECKMARK')
     else:
         lay.label(text="Place everyone, then Add Beat", icon='INFO')
 
@@ -5586,7 +5929,6 @@ def draw_cams(lay, context):
         op = row.operator("bbst.cam_moves", text="", icon='DECORATE_KEYFRAME' if moves else 'DECORATE_ANIMATE',
                           depress=moves)
         op.cam_name, op.on = ob.name, not moves
-        row.operator("bbst.cam_bind", text="", icon='MARKER_HLT').cam_name = ob.name
         if artist:
             row.operator("bbst.playblast", text="", icon='RENDER_ANIMATION').cam_name = ob.name
         op = row.operator("bbst.obj_action", text="", icon='X')
@@ -5595,14 +5937,17 @@ def draw_cams(lay, context):
     if stage_cams(scene):
         sub = lay.row()
         sub.enabled = False
-        sub.label(text="Key button lit: moves on beats · dim: static", icon='INFO')
+        sub.label(text="Key lit: moves on beats · dim: static", icon='INFO')
+        sub = lay.row()
+        sub.enabled = False
+        sub.label(text="Cuts: preview pane header or the timeline", icon='MARKER_HLT')
 
 
 def draw_outputs(lay, context):
     lay.operator("bbst.export_pack", icon='EXPORT')
     lay.operator("bbst.top_map", icon='AXIS_TOP')
     if any(mk.camera for mk in context.scene.timeline_markers):
-        op = lay.operator("bbst.playblast", text="Playblast Edit (beat cuts)", icon='SEQUENCE')
+        op = lay.operator("bbst.playblast", text="Playblast Edit (camera cuts)", icon='SEQUENCE')
         op.cam_name = ""
         op.use_cuts = True
 
@@ -6013,6 +6358,7 @@ CLASSES = [
     BBST_OT_play, BBST_OT_from_start, BBST_OT_step_beat,
     BBST_OT_fit_range, BBST_UL_beats,
     BBST_OT_cam_add, BBST_OT_cam_moves, BBST_OT_rename, BBST_OT_cam_look, BBST_OT_cam_bind,
+    BBST_OT_cut_here, BBST_OT_cut_remove, BBST_OT_beat_insert, BBST_OT_reset_moves,
     BBST_OT_pane_world, BBST_OT_pane_view, BBST_OT_pane_cam, BBST_OT_pane_lens,
     BBST_OT_lens_step, BBST_OT_pane_shading, BBST_OT_pan, BBST_OT_block, BBST_OT_block_easy,
     BBST_OT_mark_ceilings, BBST_OT_detect_floors, BBST_OT_fix_screen, BBST_OT_rebuild_shell,
@@ -6028,7 +6374,8 @@ PROP_CLONES = []
 
 _HANDLERS = (("load_post", "_bbst_on_load"), ("save_pre", "_bbst_save_pre"),
              ("save_post", "_bbst_save_post"), ("undo_post", "_bbst_undo"),
-             ("redo_post", "_bbst_undo"), ("depsgraph_update_post", "_bbst_on_depsgraph"))
+             ("redo_post", "_bbst_undo"), ("depsgraph_update_post", "_bbst_on_depsgraph"),
+             ("frame_change_post", "_bbst_on_frame"))
 _TIMERS_KEY = "bbst_timers"
 
 

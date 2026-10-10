@@ -4,6 +4,27 @@
   "data": [
     {
       "schema_version": "1.0.0",
+      "id": "bb_crowd",
+      "name": "BB Crowd",
+      "tagline": "Procedural crowds for blocking: controllers and character fields",
+      "version": "0.4.1",
+      "type": "add-on",
+      "maintainer": "Lakao456",
+      "license": [
+        "SPDX:GPL-2.0-or-later"
+      ],
+      "blender_version_min": "5.0.0",
+      "website": "https://github.com/Lakao456/bb-set-viewer",
+      "tags": [
+        "3D View",
+        "Animation"
+      ],
+      "archive_url": "./bb_crowd-0.4.1.zip",
+      "archive_size": 16531,
+      "archive_hash": "sha256:17ffbb3c34f1766b08b730af20f89cc6341528ee53b21153ddedf0ce1a724f7c"
+    },
+    {
+      "schema_version": "1.0.0",
       "id": "bb_map",
       "name": "BB Map",
       "tagline": "Working areas, tiles and level of detail for city map files",
@@ -74,7 +95,7 @@
       "id": "bb_stage",
       "name": "BB Stage",
       "tagline": "Staging and blocking previs: studio, beats and cameras",
-      "version": "0.14.1",
+      "version": "0.15.1",
       "type": "add-on",
       "maintainer": "Lakao456",
       "license": [
@@ -90,9 +111,9 @@
         "Animation",
         "Camera"
       ],
-      "archive_url": "./bb_stage-0.14.1.zip",
-      "archive_size": 64115,
-      "archive_hash": "sha256:d619139ff2dad23a15e705274ac38a4d299b856edfcb75556896522e4a3e90f6"
+      "archive_url": "./bb_stage-0.15.1.zip",
+      "archive_size": 67867,
+      "archive_hash": "sha256:8266d92e2a58deecde66fa7bbc4ea1e6e90ee418f481d90673fb4455c02e8821"
     }
   ]
 }
