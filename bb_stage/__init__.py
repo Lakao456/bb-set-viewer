@@ -6,6 +6,16 @@ own scene ("STG <label>") inside the set's .blend; the master set scene stays un
 
 Modes: EASY (direction team — characters, beats, cameras) / ARTIST (everything: staging builder,
 studio kit, stand-ins, outputs, settings). Separate from BB Set Viewer for now (Aman, 4 Oct 2026).
+
+0.16 (11 Oct 2026, "the blockout was feeling very mechanical"): Natural moves (everybody takes the time
+their own move needs, sets off and settles apart from the others, walkers turn to where they go; one
+move can be timed by hand in Beats › Timing), Life in the holds, a retime that carries every key and
+marker of the staging (cuts, lens, crowd cues, hand-made keys), and per camera Handheld, Travels with
+a character, and Zoom on the beats.
+
+0.17 (12 Oct 2026, the Gossip Maze POV): a camera can sit in a character's Eyes — his gaze is posed on
+the beats like any other pose — and Step off at a beat you choose, letting go over a second or so and
+flying to wherever you parked it on the next beat, in one unbroken shot.
 """
 
 import json
@@ -17,16 +27,18 @@ from contextlib import contextmanager
 import bpy
 import bmesh
 from bpy.app.handlers import persistent
-from mathutils import Matrix, Quaternion, Vector
+from mathutils import Euler, Matrix, Quaternion, Vector
 
 bl_info = {
     "name": "BB Stage",
     "author": "Beta Builder",
-    "version": (0, 15, 1),
+    "version": (0, 18, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > BB Stage",
     "category": "3D View",
 }
+# Blender drops or replaces bl_info on extension modules after import: keep our own copy for runtime use
+VERSION = tuple(bl_info["version"])
 
 STG_PREFIX = "STG "
 LAYER_KEY = "bb_st_layer"          # on collections: SET / STUDIO / STAGE
@@ -35,7 +47,8 @@ SOURCE_KEY = "bb_st_source"        # stand-in: name of the set object it stands 
 STANDIN_KEY = "bb_st_standin"      # prop flag: placeholder that must never appear in outputs
 DT_BACKUP_KEY = "bb_st_dt0"        # ghost mode: original display_type backup
 LOCK_KEY = "bb_st_locked"
-CAM_KEY = "bb_st_keyed"            # camera: moves on the beats (static cameras carry no keys)
+CAM_KEY = "bb_st_keyed"            # camera: moves on the beats (0.17 and earlier; kept for old files)
+STATIC_KEY = "bb_st_static"        # camera: Static — it takes no part in the beats and carries no keys
 
 PEG_COLORS = [
     (0.90, 0.25, 0.20, 1.0), (0.20, 0.55, 0.95, 1.0), (0.25, 0.75, 0.30, 1.0),
@@ -76,7 +89,7 @@ L1_COLL = "Upper floor — Level 1"
 SUB_KEY = "bb_st_sub"              # on STAGE sub-collections: Characters / Props / Cameras
 HOME_KEY = "bb_st_home"            # set object moved into a level collection: where it came from
 TINT_KEY = "bb_st_c0"              # ghost tint: the object's own colour, restored before saving
-DATA_VERSION = 9
+DATA_VERSION = 10
 EYE_HEIGHT = 1.6
 HUMAN_MAX_SPEED = 4.0          # m/s between beats: a sprint; above it the beat panel turns red (Aman, 10 Oct 2026)
 PEG_MESH_VERSION = 2           # 2: no base disc (Aman, 10 Oct 2026: the disc made characters look bigger)
@@ -295,6 +308,12 @@ def migrate_staging(scene):
                 lock_floor(ob)
     if st.data_version < 9:
         st["use_floors"] = True         # stagings made before the switch were built on floors
+    if st.data_version < 10:
+        # cameras are keyed by default from 0.18. A camera that was deliberately left out of the beats
+        # before stays out: it is marked Static, so an old staging plays exactly as it did.
+        for cam in stage_cams(scene):
+            if not cam.get(CAM_KEY) and STATIC_KEY not in cam:
+                cam[STATIC_KEY] = True
     if st.data_version < DATA_VERSION:
         _QUIET["floor"] = True          # an upgrade must not re-detect the floor and move things
         try:
@@ -694,35 +713,46 @@ def sync_markers(scene):
 
 
 def keyed_objects(scene):
-    """Everything the beats key: characters, props, and the cameras set to move on the beats
-    (one on a gimbal while the others stay put, Aman 5 Oct 2026)."""
-    st = scene.bb_st
-    obs = stage_objects(scene, roles=("char", "prop"))
-    obs += [c for c in stage_cams(scene) if st.key_cameras or c.get(CAM_KEY)]
+    """Everything the beats key: characters, props, the aim and eyes helpers, and every camera except the
+    ones switched to Static. Cameras are keyed by default (Aman, 13 Oct 2026: "make the camera keyframeable
+    by default and not by pushing a button") — a camera that never moves costs one key, because a pose is
+    only keyed where it changes."""
+    obs = stage_objects(scene, roles=("char", "prop", EYES_ROLE, AIM_ROLE))
+    obs += [c for c in stage_cams(scene) if cam_moves(c)]
     return obs
 
 
 def cam_moves(ob):
-    return bool(ob is not None and ob.get(CAM_KEY))
+    return bool(ob is not None and not ob.get(STATIC_KEY))
 
 
 def set_cam_moves(scene, cam, on):
-    """On: the camera is keyed on every beat at its current pose (then move it on a beat and
-    Save Beat). Off: its beat keys and paths go, it stays where it is now."""
+    """On: the camera takes part in the beats, keyed where it moves (the default). Off — Static: its beat
+    keys and paths go and it stays where it is now, untouched by anything."""
     st = scene.bb_st
     if on:
-        cam[CAM_KEY] = True
-        for b in st.beats:
-            for f in sorted({b.frame, beat_out(b)}):
-                cam.keyframe_insert("location", frame=f, group="BB Stage")
-                cam.keyframe_insert("rotation_euler", frame=f, group="BB Stage")
+        if STATIC_KEY in cam:
+            del cam[STATIC_KEY]
+        cam[CAM_KEY] = True                  # 0.17 and earlier read this; harmless to keep writing it
+        if not block_channels(cam) and len(st.beats):
+            f0 = st.beats[_clamped_beat(st)].frame
+            cam.keyframe_insert("location", frame=f0, group="BB Stage")
+            cam.keyframe_insert("rotation_euler", frame=f0, group="BB Stage")
+        rebuild_blocking(scene)
         return
+    cam[STATIC_KEY] = True
     for k in reversed(range(len(st.paths))):
         if st.paths[k].owner == cam:
             remove_path(scene, k)
     loc, rot = cam.location.copy(), cam.rotation_euler.copy()
     _drop_fcurves(cam, {"location", "rotation_euler"})
     cam.location, cam.rotation_euler = loc, rot
+    set_zoom(scene, cam, False)
+    for k in reversed(range(len(st.moves))):
+        if st.moves[k].owner == cam:
+            st.moves.remove(k)
+    if MOVE_KEY in cam:
+        del cam[MOVE_KEY]
     if CAM_KEY in cam:
         del cam[CAM_KEY]
 
@@ -731,17 +761,105 @@ def beat_out(b):
     return max(b.frame, b.frame_out)
 
 
+def id_fcurves(idb):
+    """The F-curves that animate this data-block: its own slot of its action (an object and its camera
+    data can share one action since Blender 4.4)."""
+    ad = getattr(idb, "animation_data", None)
+    act = ad.action if ad is not None else None
+    if act is None:
+        return []
+    handle = getattr(getattr(ad, "action_slot", None), "handle", None)
+    out = []
+    for layer in act.layers:
+        for strip in layer.strips:
+            for cb in strip.channelbags:
+                if handle is None or getattr(cb, "slot_handle", handle) == handle:
+                    out.extend(cb.fcurves)
+    return out
+
+
+_BLOCK_PATHS = ("location", "rotation_euler")
+LENS_CH = ("lens", 0)              # a zooming camera: its lens is part of the beat pose
+MOVE_KEY = "bb_st_moves"           # on keyed objects: {beat uid: [first, last frame]} it really moves in (Natural moves)
+try:
+    _KEY_TYPES = {i.identifier for i in bpy.types.Keyframe.bl_rna.properties["type"].enum_items}
+except Exception:
+    _KEY_TYPES = set()
+GEN_KEY = 'GENERATED' if 'GENERATED' in _KEY_TYPES else 'BREAKDOWN'     # the in-between keys the layout derives
+_CARRY = {}                         # sample_beat_poses → write_beat_layout: where the beats were, the hand-made keys
+
+
+def lens_fcurve(cam):
+    """The lens curve of a camera that zooms on the beats (None: its lens is one fixed value)."""
+    if cam is None or cam.type != 'CAMERA' or cam.data is None:
+        return None
+    return next((fc for fc in id_fcurves(cam.data) if fc.data_path == "lens"), None)
+
+
+def block_channels(ob):
+    """{(path, index): F-curve} of everything a beat poses on this object: where it stands, how it is
+    turned and, for a camera that zooms, its lens."""
+    out = {}
+    for fc in id_fcurves(ob):
+        if fc.data_path in _BLOCK_PATHS:
+            out[(fc.data_path, fc.array_index)] = fc
+    fc = lens_fcurve(ob)
+    if fc is not None:
+        out[LENS_CH] = fc
+    return out
+
+
+def current_pose(ob, chans):
+    """Where this object is standing right now, on the channels the beats hold."""
+    out = {}
+    for key in chans:
+        path, idx = key
+        if key == LENS_CH:
+            out[key] = float(ob.data.lens)
+        else:
+            out[key] = float(getattr(ob, path)[idx])
+    return out
+
+
 def save_beat(scene, index):
-    """Key everyone's current pose on this beat: on its arrival frame and, when it holds, on
-    the frame it leaves, so the hold stays still."""
+    """Save everyone's pose on this beat. A pose that changed carries on through the beats that were
+    holding the old one, so moving something inside a hold moves the whole hold — instead of the old
+    behaviour, where the next beat still held the old pose and pulled it straight back (Aman, 13 Oct 2026)."""
     st = scene.bb_st
     b = st.beats[index]
     sync_peg_colors(scene)
-    for ob in keyed_objects(scene):
-        for f in sorted({b.frame, beat_out(b)}):
+    frames = sorted({b.frame, beat_out(b)})
+    for ob in keyed_objects(scene):             # anything not keyed yet gets its curves here
+        if block_channels(ob):
+            continue
+        for f in frames:
             ob.keyframe_insert("location", frame=f, group="BB Stage")
             ob.keyframe_insert("rotation_euler", frame=f, group="BB Stage")
+    poses = sample_beat_poses(scene)            # what the beats hold at this moment, before the save
+    n = len(st.beats)
+    for ob in keyed_objects(scene):
+        rows = poses.get(ob.name)
+        chans = block_channels(ob)
+        if rows is None or not chans:
+            continue
+        for key, v in current_pose(ob, chans).items():
+            old = rows[index].get(key)
+            if old is not None and abs(v - old) <= KEY_EPS:
+                continue
+            rows[index][key] = v
+            for j in range(index + 1, n):       # the rest of the hold comes along
+                if old is None or abs(rows[j].get(key, old) - old) > KEY_EPS:
+                    break
+                rows[j][key] = v
+    write_beat_layout(scene, poses)
     b.dirty = False
+    for ob in keyed_objects(scene):     # rotations were unwound the short way round: same pose, other number
+        rot = keyed_rotation_at(ob, b.frame)
+        if any(abs(x - y) > 1e-6 for x, y in zip(rot, ob.rotation_euler)):
+            ob.rotation_euler = rot
+    if st.alive > 0.0:
+        apply_alive(scene)              # a character added since the last save comes alive too
+    apply_eyes(scene)                   # a POV camera keeps the pose its eyes have on this beat
 
 
 def beat_layout(scene, start=None):
@@ -757,55 +875,1135 @@ def beat_layout(scene, start=None):
     return out
 
 
-_BLOCK_PATHS = ("location", "rotation_euler")
-
-
 def sample_beat_poses(scene):
-    """Every keyed object's pose on every beat: {object name: [{(path, index): value}, ...]}."""
+    """Every keyed object's pose on every beat: {object name: [{(path, index): value}, ...]}. It also
+    notes, for the layout that follows, where the beats are now and which keys somebody made by hand
+    between them, so a retime can take those along."""
     st = scene.bb_st
-    poses = {}
+    poses, hand = {}, {}
+    marks = {int(f) for b in st.beats for f in (b.frame, beat_out(b))}
     for ob in keyed_objects(scene):
-        ad = ob.animation_data
-        fcs = [fc for fc in channelbag_fcurves(ad.action) if fc.data_path in _BLOCK_PATHS] if (ad and ad.action) else []
-        if fcs:
-            poses[ob.name] = [{(fc.data_path, fc.array_index): fc.evaluate(b.frame) for fc in fcs} for b in st.beats]
+        chans = block_channels(ob)
+        if not chans:
+            continue
+        poses[ob.name] = [{key: fc.evaluate(b.frame) for key, fc in chans.items()} for b in st.beats]
+        for key, fc in chans.items():
+            mine = [(kp.co.x, kp.co.y) for kp in fc.keyframe_points
+                    if kp.type != GEN_KEY and int(round(kp.co.x)) not in marks]
+            if mine:
+                hand[(ob.name, key)] = mine
+    _CARRY.clear()
+    _CARRY.update(scene=scene.name, old={b.uid: (b.frame, beat_out(b)) for b in st.beats}, hand=hand)
     return poses
 
 
-def write_beat_layout(scene, poses, start=None):
-    """Re-key the blocking from the beat poses on the current Move/Hold timing."""
+# ------------------------------------------------------------------ a retime carries everything (0.16)
+#
+# Until 0.15 a change of a Move or Hold time re-timed the blocking and the beat markers only: camera cuts,
+# lens and scale keys, crowd cues and whatever else was timed against the beats stayed behind. Now every
+# key and marker of the staging rides along: what sat on a beat stays on that beat, what sat between two
+# beats keeps its place between them.
+
+def time_map(old, new):
+    """A function that takes a frame of the old beat layout to the new one, or None when nothing moved.
+    old, new: {beat uid: (arrive, leave)}."""
+    pairs = sorted({(x, y) for uid, ad in old.items() if uid in new for x, y in zip(ad, new[uid])})
+    clean = []
+    for x, y in pairs:              # a beat that changed its place in the order (Insert Beat) is no anchor
+        if not clean or y >= clean[-1][1]:
+            clean.append((x, y))
+    if not clean or all(x == y for x, y in clean):
+        return None
+    xs = [p[0] for p in clean]
+    ys = [p[1] for p in clean]
+
+    def remap(x):
+        import bisect
+        j = bisect.bisect_left(xs, x)
+        if j < len(xs) and xs[j] == x:
+            return float(ys[j])                    # on a beat: stays on that beat (its arrival, when it now holds)
+        if j == 0:
+            return x + (ys[0] - xs[0])
+        if j == len(xs):
+            return x + (ys[-1] - xs[-1])
+        x0, y0, x1, y1 = xs[j - 1], ys[j - 1], xs[j], ys[j]
+        return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+    return remap
+
+
+def _retime_fcurve(fc, tmap):
+    moved = False
+    for kp in fc.keyframe_points:
+        x = kp.co.x
+        nx = float(round(tmap(x)))
+        if abs(nx - x) < 1e-6:
+            continue
+        lx, rx = tmap(kp.handle_left.x), tmap(kp.handle_right.x)
+        kp.co.x = nx
+        kp.handle_left.x = min(lx, nx)
+        kp.handle_right.x = max(rx, nx)
+        moved = True
+    if moved:
+        fc.keyframe_points.sort()
+        fc.keyframe_points.deduplicate()
+        fc.update()
+    return moved
+
+
+def _is_beat_marker(m):
+    head = m.name.split(" ", 1)[0]
+    return head[:1] == "B" and head[1:].isdigit()
+
+
+def carried_ids(scene):
+    """Every data-block whose animation is timed against this staging's beats: all that lives in its STAGE
+    layer (characters, props, cameras and their lenses, crowds) and, when Settings says so, the set."""
+    st = scene.bb_st
+    obs = []
+    for c in layer_colls(scene, "STAGE"):
+        obs += coll_objects(c)
+    if st.carry_set:
+        for c in layer_colls(scene, "SET"):
+            obs += coll_objects(c)
+        obs += instanced_objects(scene)
+    out, seen = [], set()
+    for ob in obs:
+        if ob.get(ROLE_KEY) == FOLLOWER_ROLE:
+            continue                    # a path follower is re-keyed by its path
+        for idb in (ob, ob.data, getattr(ob.data, "shape_keys", None)):
+            if idb is not None and idb.as_pointer() not in seen:
+                seen.add(idb.as_pointer())
+                out.append((ob, idb))
+    return out
+
+
+def carry_animation(scene, tmap):
+    """Move every marker and key that the layout does not rebuild itself to the new timing."""
+    keyed = {ob.name for ob in keyed_objects(scene)}
+    n = 0
+    for m in scene.timeline_markers:
+        if _is_beat_marker(m):
+            continue                    # sync_markers puts those on their beats
+        nf = int(round(tmap(m.frame)))
+        if nf != m.frame:
+            m.frame = nf
+            n += 1
+    seen = set()
+    for ob, idb in carried_ids(scene):
+        mine = ob.name in keyed
+        for fc in id_fcurves(idb):
+            p = fc.as_pointer()
+            if p in seen:
+                continue
+            seen.add(p)
+            if mine and idb == ob and fc.data_path in _BLOCK_PATHS:
+                continue                # the blocking: rebuilt from the beat poses
+            if mine and idb != ob and fc.data_path == "lens":
+                continue                # a zoom on the beats: rebuilt too
+            if fc.data_path.startswith(f'constraints["{PATH_CON}'):
+                continue                # a drawn move: re-keyed by its path
+            n += bool(_retime_fcurve(fc, tmap))
+    return n
+
+
+# ------------------------------------------------------------------ natural moves (0.16)
+#
+# Aman, 11 Oct 2026: "the current blockout was feeling very mechanical". Until 0.15 everybody left a beat
+# on the same frame, eased on the same curve over the whole move and froze together on the next beat.
+# With Natural moves on, the beat poses stay the only truth and the layout derives the in-between:
+#   - everybody takes the time their own move needs (a walk at the walking pace, a step, a turn); the
+#     rest of the move is slack: they set off a little after each other and settle before the beat;
+#   - a walker turns to where it is going just before it sets off and to its final facing as it lands;
+#     walks hold a steady pace between a short start and stop, steps and turns ease all the way;
+#   - a prop that stays with a character moves exactly with it;
+#   - cameras that move on the beats travel the whole move, with feathered ends.
+# Beats › Timing sets any one move by hand (starts after, lands early). The derived keys are typed
+# "generated" (the small diamonds in the dope sheet) and are rebuilt on every Save Beat and every retime,
+# so they can not go stale. Rotations take the short way round.
+
+WALK_MIN = 1.2          # metres: from here on a move is a walk (turn, go, turn); below it a step that keeps its facing
+RAMP_GAIN = 1.4         # a flat Bezier handle of h frames reaches 90 % of the cruising speed after about 1.4 h
+WALK_RAMP = 0.55        # seconds a walker takes to get up to pace, and to stop
+WALK_LOSS = WALK_RAMP / RAMP_GAIN   # the time those two ramps cost: a walk of d metres takes d / pace + this
+
+
+def _wrap(a):
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def turn_secs(rad):
+    """How long an unhurried turn of this size takes: 30° about 0.5 s, 90° 1 s, 180° 1.7 s (it peaks near 160°/s)."""
+    return min(1.8, max(0.35, 0.3 + abs(math.degrees(rad)) / 130.0))
+
+
+def _jitter(name, uid, salt=0):
+    """A fixed number 0..1 per object and beat: the same on every rebuild, different for everybody."""
+    h = 2166136261
+    for ch in f"{name}|{uid}|{salt}":
+        h = ((h ^ ord(ch)) * 16777619) & 0xFFFFFFFF
+    return h / 0xFFFFFFFF
+
+
+def move_rec(scene, ob, uid):
+    """The hand-set timing of this object's move into this beat, if any."""
+    for m in scene.bb_st.moves:
+        if ob is not None and m.owner == ob and m.beat_uid == uid:
+            return m
+    return None
+
+
+def natural_plans(scene, poses, layout):
+    """For every keyed object and every move: the frames it really moves in and how.
+    {object name: [None, plan, ...]}, plan = dict(s2, e2, mode, h, heading); None = nothing to plan."""
+    st = scene.bb_st
+    f = fps(scene)
+    pace = max(0.2, st.pace)
+    objs = {ob.name: ob for ob in keyed_objects(scene)}
+    recs = {(m.owner.name, m.beat_uid): m for m in st.moves if m.owner is not None}
+    plans = {name: [None] * len(st.beats) for name in poses}
+    xy = (("location", 0), ("location", 1))
+    for i in range(1, len(st.beats)):
+        s, e = layout[i - 1][1], layout[i][0]
+        span = e - s
+        if span < max(3, round(0.4 * f)):
+            continue                        # a cut: everybody is simply there
+        uid = st.beats[i].uid
+        todo, chars = [], {}
+        for name, plist in poses.items():
+            ob = objs.get(name)
+            if ob is None:
+                continue
+            p, q = plist[i - 1], plist[i]
+            dv = Vector([q.get(("location", k), 0.0) - p.get(("location", k), 0.0) for k in range(3)])
+            flat, dist = math.hypot(dv.x, dv.y), dv.length
+            rot = [abs(_wrap(q.get(("rotation_euler", k), 0.0) - p.get(("rotation_euler", k), 0.0))) for k in range(3)]
+            zoom = abs(q.get(LENS_CH, 0.0) - p.get(LENS_CH, 0.0))
+            if dist < 1e-4 and max(rot) < 1e-4 and zoom < 1e-4:
+                continue
+            role = "cam" if ob.type == 'CAMERA' else ob.get(ROLE_KEY)
+            it = dict(name=name, role=role, rec=recs.get((name, uid)), p=p, q=q, heading=0.0)
+            path = path_for(scene, ob, uid)
+            if role == "cam":
+                it.update(mode='GLIDE', need=span / f)
+            elif path is not None:
+                it.update(mode='PATH', need=path_length(path) / pace + WALK_LOSS)
+            elif role == "char":
+                face = it["rec"].face if it["rec"] is not None else 'AUTO'
+                walk = flat >= WALK_MIN if face == 'AUTO' else (face == 'ALONG' and flat > 0.05)
+                if walk:
+                    it.update(mode='WALK', need=flat / pace + WALK_LOSS, heading=math.atan2(-dv.x, dv.y))
+                elif dist >= 0.05:
+                    it.update(mode='STEP', need=max(0.5 + 0.9 * dist if dist < WALK_MIN else dist / pace + WALK_LOSS,
+                                                    turn_secs(rot[2]) if rot[2] > math.radians(1.0) else 0.0))
+                elif max(rot) >= math.radians(1.0):
+                    it.update(mode='TURN', need=turn_secs(max(rot)))
+                else:
+                    continue                # a hair of a change: it eases over the whole move
+                chars[name] = it
+            else:
+                it.update(mode='GLIDE', need=min(span / f, 0.5 + dist / 6.0))
+            todo.append(it)
+        for it in todo:                     # a prop that is with the same character before and after rides with it
+            if it["role"] != "prop" or it["rec"] is not None or not all(k in it["p"] for k in xy):
+                continue
+            best = None
+            for c in chars.values():
+                if not all(k in c["p"] for k in xy):
+                    continue
+                d0 = math.hypot(it["p"][xy[0]] - c["p"][xy[0]], it["p"][xy[1]] - c["p"][xy[1]])
+                d1 = math.hypot(it["q"][xy[0]] - c["q"][xy[0]], it["q"][xy[1]] - c["q"][xy[1]])
+                if d0 < 0.8 and d1 < 0.8 and (best is None or d0 + d1 < best[0]):
+                    best = (d0 + d1, c)
+            if best is not None:
+                it["carrier"] = best[1]
+        free = [it for it in todo if it["role"] != "cam" and it["rec"] is None and "carrier" not in it]
+        free.sort(key=lambda it: (-it["need"], _jitter(it["name"], uid)))
+        stops = set()
+        for rank, it in enumerate(free):    # whoever has the most to do leads, the others follow a beat later
+            need = max(2, round(it["need"] * f))
+            slack = span - need
+            if slack <= round(0.12 * f):
+                s2, e2 = s, e
+            else:
+                wait = (0.10 + 0.18 * min(rank, 5) + 0.10 * _jitter(it["name"], uid, 1)) * f
+                s2 = s + min(round(wait), int(slack * 0.5))
+                e2 = s2 + need
+            while e2 in stops and e2 - s2 > 2:
+                e2 -= 1                     # nobody stops on the same frame as somebody else
+            stops.add(e2)
+            it["win"] = (s2, e2)
+        for it in todo:
+            if it["rec"] is not None:
+                s2 = min(e - 2, s + round(max(0.0, it["rec"].start_s) * f))
+                it["win"] = (s2, min(e, max(s2 + 2, e - round(max(0.0, it["rec"].end_s) * f))))
+            elif it["role"] == "cam":
+                it["win"] = (s, e)
+        for it in todo:
+            c = it.get("carrier")
+            if c is not None:
+                it["win"], it["mode"] = c["win"], 'CARRIED'
+        for it in todo:
+            s2, e2 = it["win"]
+            src = it.get("carrier") or it
+            if src["role"] == "cam":
+                h = min(1.4, max(0.35, 0.25 * (e2 - s2) / f)) * f / RAMP_GAIN
+            elif src["mode"] in ('WALK', 'PATH'):
+                h = WALK_RAMP * f / RAMP_GAIN
+            else:
+                h = None                    # a step, a turn, a glide: eased all the way
+            plans[it["name"]][i] = dict(s2=s2, e2=e2, mode=it["mode"], h=h, heading=it["heading"])
+    return plans
+
+
+KEY_EPS = 1e-6              # closer than this on a channel and the two beats hold the same pose
+
+
+def _hold_interior(values):
+    """Which beats need no key on this channel: the ones inside a hold, where nothing moves either side.
+    A move keeps a key at both ends, so holds can be dragged whole and the curve editor stays readable."""
+    n = len(values)
+    skip = set()
+    for i in range(1, n - 1):
+        if abs(values[i] - values[i - 1]) <= KEY_EPS and abs(values[i + 1] - values[i]) <= KEY_EPS:
+            skip.add(i)
+    return skip
+
+
+def _natural_keys(chans, plist, plans, layout, f):
+    """One object's keys on every channel, derived from its beat poses and its plans:
+    {(path, index): ([(frame, value, generated, auto handle)], {(frame, frame): handle length})}."""
+    out = {key: ([], {}) for key in chans}
+    anchors = {key: [] for key in chans}        # (beat, arrive, leave, value, auto): filtered before they are written
+    cur = {}
+    yaw = ("rotation_euler", 2)
+    n = len(plist)
+
+    def put(key, frame, value, gen=True, auto=False):
+        out[key][0].append((int(frame), float(value), gen, auto))
+
+    def through(i):
+        """A camera or prop on its way through a beat it does not hold on keeps moving."""
+        if not (0 < i < n - 1) or layout[i][1] > layout[i][0]:
+            return False
+        a, b = plans[i], plans[i + 1]
+        return bool(a and b and a["mode"] == b["mode"] == 'GLIDE'
+                    and (a["s2"], a["e2"]) == (layout[i - 1][1], layout[i][0])
+                    and (b["s2"], b["e2"]) == (layout[i][1], layout[i + 1][0]))
+
+    for i in range(n):
+        a, d = layout[i]
+        plan = plans[i] if i else None
+        tgt = {}
+        for key in chans:
+            v = plist[i].get(key, cur.get(key, 0.0))
+            if key[0] == "rotation_euler" and key in cur:
+                v = cur[key] + _wrap(v - cur[key])          # the short way round
+            tgt[key] = v
+        if plan is not None:
+            s, s2, e2, mode, h = layout[i - 1][1], plan["s2"], plan["e2"], plan["mode"], plan["h"]
+            dur = e2 - s2
+            for key in chans:
+                p, q = cur[key], tgt[key]
+                if abs(q - p) < 1e-7 or (key == yaw and mode == 'WALK'):
+                    continue
+                k1 = e2
+                if key == yaw and mode in ('STEP', 'TURN'):
+                    k1 = min(e2, s2 + max(2, round(turn_secs(q - p) * f)))     # the turn comes first
+                if s2 > s:
+                    put(key, s2, p)
+                if k1 < a:
+                    put(key, k1, q)
+                if h is not None and (key[0] == "location" or key == LENS_CH or mode == 'GLIDE'):
+                    out[key][1][(int(s2), int(k1))] = h
+            if mode == 'WALK' and yaw in chans:
+                y0 = cur[yaw]
+                way = y0 + _wrap(plan["heading"] - y0)
+                y1 = way + _wrap(tgt[yaw] - way)
+                tgt[yaw] = y1
+                t_in = round(turn_secs(way - y0) * f) if abs(way - y0) > math.radians(3.0) else 0
+                t_out = round(turn_secs(y1 - way) * f) if abs(y1 - way) > math.radians(3.0) else 0
+                t_in, t_out = min(t_in, int(dur * 0.45)), min(t_out, int(dur * 0.45))
+                if t_in:
+                    ts = max(s, s2 - round(0.2 * f))        # the turn starts just before the feet do
+                    if ts > s:
+                        put(yaw, ts, y0)
+                    put(yaw, ts + t_in, way)
+                if t_out:
+                    put(yaw, e2 - t_out, way)
+                if e2 < a:
+                    put(yaw, e2, y1)
+        auto = through(i)
+        for key in chans:
+            anchors[key].append((i, a, d, tgt[key], auto))
+        cur = tgt
+    for key, rows in anchors.items():           # only the ends of a move are keyed, never the inside of a hold
+        skip = _hold_interior([r[3] for r in rows])
+        for i, a, d, v, auto in rows:
+            if i in skip:
+                continue
+            put(key, a, v, gen=False, auto=auto)
+            if d > a:
+                put(key, d, v, gen=False)
+    return out
+
+
+def _write_channel(fc, keys, caps):
+    """Make one blocking F-curve hold exactly these keys: flat handles (everybody stops on a pose), as
+    long as a third of the way to the neighbour or as short as the cap says (a steady walk)."""
+    merged = []
+    for k in sorted(keys, key=lambda k: k[0]):
+        if merged and merged[-1][0] == k[0]:
+            merged[-1] = (k[0], k[1], merged[-1][2] and k[2], merged[-1][3] or k[3])
+        else:
+            merged.append(k)
+    while len(fc.keyframe_points):
+        fc.keyframe_points.remove(fc.keyframe_points[-1], fast=True)
+    n = len(merged)
+    fc.keyframe_points.add(n)
+    for j, (kp, (x, y, gen, auto)) in enumerate(zip(fc.keyframe_points, merged)):
+        kp.co = (x, y)
+        kp.interpolation = 'BEZIER'
+        kp.type = GEN_KEY if gen else 'KEYFRAME'
+        if auto:
+            kp.handle_left_type = kp.handle_right_type = 'AUTO_CLAMPED'
+            continue
+        left = (x - merged[j - 1][0]) if j else (merged[1][0] - x if n > 1 else 9.0)
+        right = (merged[j + 1][0] - x) if j < n - 1 else left
+        hl, hr = left / 3.0, right / 3.0
+        if j:
+            hl = min(hl, caps.get((merged[j - 1][0], x), hl))
+        if j < n - 1:
+            hr = min(hr, caps.get((x, merged[j + 1][0]), hr))
+        kp.handle_left_type = kp.handle_right_type = 'FREE'
+        kp.handle_left = (x - hl, y)
+        kp.handle_right = (x + hr, y)
+    fc.update()
+
+
+def write_beat_layout(scene, poses, start=None, _again=False):
+    """Re-key the blocking from the beat poses on the current Move/Hold timing. Everything else that is
+    timed against the beats (camera cuts, lens and scale keys, crowd cues, hand-made keys) goes along."""
     st = scene.bb_st
     if not len(st.beats):
         return
+    carry = dict(_CARRY) if _CARRY.get("scene") == scene.name else {}
+    _CARRY.clear()
     layout = beat_layout(scene, start)
+    tmap = time_map(carry.get("old", {}), {b.uid: ad for b, ad in zip(st.beats, layout)})
+    marks = {int(x) for ad in layout for x in ad}
+    hand = carry.get("hand", {})
+    natural = bool(st.natural)
+    plans = natural_plans(scene, poses, layout) if natural else {}
+    f = fps(scene)
     for ob in keyed_objects(scene):
         p = poses.get(ob.name)
-        ad = ob.animation_data
-        if p is None or not (ad and ad.action):
+        chans = block_channels(ob)
+        if p is None or not chans:
             continue
-        for fc in channelbag_fcurves(ad.action):
-            if fc.data_path not in _BLOCK_PATHS:
-                continue
-            key = (fc.data_path, fc.array_index)
-            pts = []
-            for (a, d), pose in zip(layout, p):
-                if key in pose:
-                    pts.append((a, pose[key]))
-                    if d > a:
-                        pts.append((d, pose[key]))
-            while len(fc.keyframe_points):
-                fc.keyframe_points.remove(fc.keyframe_points[-1], fast=True)
-            fc.keyframe_points.add(len(pts))
-            for kp, (fr, v) in zip(fc.keyframe_points, pts):
-                kp.co = (fr, v)
-                kp.interpolation = 'BEZIER'
-                kp.handle_left_type = kp.handle_right_type = 'AUTO_CLAMPED'
-            fc.update()
+        mine = plans.get(ob.name) or [None] * len(p)
+        derived = _natural_keys(chans, p, mine, layout, f) if natural else None
+        for key, fc in chans.items():
+            if natural:
+                _write_channel(fc, *derived[key])
+            else:
+                pts = []
+                vals = [pose.get(key, 0.0) for pose in p]
+                skip = _hold_interior(vals)        # the inside of a hold carries no key here either
+                for i, ((a, d), pose) in enumerate(zip(layout, p)):
+                    if key in pose and i not in skip:
+                        pts.append((a, pose[key]))
+                        if d > a:
+                            pts.append((d, pose[key]))
+                while len(fc.keyframe_points):
+                    fc.keyframe_points.remove(fc.keyframe_points[-1], fast=True)
+                fc.keyframe_points.add(len(pts))
+                for kp, (fr, v) in zip(fc.keyframe_points, pts):
+                    kp.co = (fr, v)
+                    kp.interpolation = 'BEZIER'
+                    kp.handle_left_type = kp.handle_right_type = 'AUTO_CLAMPED'
+                fc.update()
+            for x, y in hand.get((ob.name, key), ()):       # hand-made keys between beats stay, re-timed
+                nx = int(round(tmap(x) if tmap is not None else x))
+                if nx not in marks:
+                    fc.keyframe_points.insert(nx, y)
+        wins = {str(st.beats[i].uid): [pl["s2"], pl["e2"]] for i, pl in enumerate(mine) if pl}
+        had = ob.get(MOVE_KEY)
+        if wins:
+            if had is None or had.to_dict() != wins:
+                ob[MOVE_KEY] = wins
+        elif had is not None:
+            del ob[MOVE_KEY]
+    if tmap is not None:
+        carry_animation(scene, tmap)
     for b, (a, d) in zip(st.beats, layout):
         b.frame, b.frame_out = a, d
     sync_markers(scene)
     scene.frame_end = max(layout[-1][1], layout[0][0] + 1)
-    refresh_paths(scene)        # drawn moves follow the new timing (and drop with a deleted beat)
+    apply_eyes(scene)                    # a POV camera's hand-off sits on its beat, on the new timing
+    apply_look(scene)                    # and every camera's look follows its beats too
+    turned = refresh_paths(scene)        # drawn moves follow the new timing (and drop with a deleted beat)
+    if natural and turned and not _again:
+        write_beat_layout(scene, sample_beat_poses(scene), start, _again=True)     # an arrival now faces along its path
+
+
+def rebuild_blocking(scene):
+    """Natural moves: derive the in-betweens again from the beat poses, on the timing as it is (after a
+    Save Beat, a path edit, a change of Timing or of a setting)."""
+    if _QUIET["beats"] or not (is_staging(scene) and len(scene.bb_st.beats)):
+        return
+    _QUIET["beats"] = True
+    try:
+        write_beat_layout(scene, sample_beat_poses(scene))
+    finally:
+        _QUIET["beats"] = False
+
+
+def move_window(scene, ob, i):
+    """The frames this object really moves in on its way into beat i: the whole move, or the part of it
+    that Natural moves gives it."""
+    st = scene.bb_st
+    s, e = path_window(st, i)
+    if st.natural and ob is not None:
+        wins = ob.get(MOVE_KEY)
+        w = wins.get(str(st.beats[i].uid)) if wins is not None else None
+        if w is not None and s <= w[0] < w[1] <= e:
+            return int(w[0]), int(w[1])
+    return s, e
+
+
+# ------------------------------------------------------------------ life in the holds, handheld (0.16)
+#
+# Nothing here adds a key to the blocking. A character's drift is a Noise modifier on its DELTA rotation,
+# a camera's handheld is a Noise modifier on its lens shift: both ride on top of the beat poses, never
+# touch them, and are set by one slider each. Research note (11 Oct 2026): real handheld is a slow drift,
+# about a quarter of a degree, most of it below half a cycle a second; a fast jitter reads as an earthquake.
+
+NOISE_GAIN = 9.9            # Noise modifier strength for an rms of 1 (measured on Blender 5.2, depth 1)
+ALIVE_DEG = 1.0             # Life in the holds = 1: the facing drifts a degree (rms), three at its widest
+HANDHELD_SHIFT = 0.0035     # Handheld = 1: the frame drifts like a quarter of a degree on a 35 mm (rms)
+
+
+def _curve(idb, data_path, index=0):
+    return next((c for c in id_fcurves(idb) if c.data_path == data_path and c.array_index == max(0, index)), None)
+
+
+def _one_key_curve(idb, data_path, index, group):
+    """An F-curve with one key at the value the property has now: something a Noise modifier can ride on."""
+    fc = _curve(idb, data_path, index)
+    if fc is None:
+        idb.keyframe_insert(data_path, index=index, frame=1, group=group)
+        fc = _curve(idb, data_path, index)
+    return fc
+
+
+def _noise_mod(fc, k=0):
+    mods = [m for m in fc.modifiers if m.type == 'NOISE']
+    while len(mods) <= k:
+        mods.append(fc.modifiers.new('NOISE'))
+    return mods[k]
+
+
+def _set_noise(m, strength, scale, phase, depth=1):
+    for attr, val in (("blend_type", 'REPLACE'), ("strength", strength), ("scale", scale),
+                      ("phase", phase), ("depth", depth)):
+        if getattr(m, attr) != val:
+            setattr(m, attr, val)
+
+
+def apply_alive(scene):
+    """Life in the holds: every character's facing drifts a little, each in its own slow rhythm, so nobody
+    stands like a statue between moves. 0 removes it."""
+    st = scene.bb_st
+    f = fps(scene)
+    for ob in stage_objects(scene, roles=("char",)):
+        if st.alive <= 0.0:
+            if _curve(ob, "delta_rotation_euler", 2) is not None:
+                _drop_fcurves(ob, {"delta_rotation_euler"})
+                ob.delta_rotation_euler = (0.0, 0.0, 0.0)
+            continue
+        fc = _curve(ob, "delta_rotation_euler", 2)
+        if fc is None:
+            ob.delta_rotation_euler[2] = 0.0
+            fc = _one_key_curve(ob, "delta_rotation_euler", 2, "BB Stage life")
+        if fc is None:
+            continue
+        _set_noise(_noise_mod(fc), math.radians(ALIVE_DEG) * st.alive * NOISE_GAIN,
+                   2.6 * f * (0.8 + 0.4 * _jitter(ob.name, 0, 7)), 100.0 * _jitter(ob.name, 0, 8))
+
+
+def apply_handheld(cam_data, f=24.0):
+    """Handheld: the frame drifts slowly with a little faster tremor on top, the same amount in the picture
+    at any lens. It is lens shift, so the camera itself stays exactly where the beats put it. 0 removes it."""
+    amt = cam_data.bbst_handheld
+    for k, path in enumerate(("shift_x", "shift_y")):
+        fc = _curve(cam_data, path)
+        if amt <= 0.0:
+            if fc is not None:
+                base = fc.keyframe_points[0].co.y if len(fc.keyframe_points) else 0.0
+                _drop_fcurves(cam_data, {path})
+                setattr(cam_data, path, base)
+            continue
+        if fc is None:
+            fc = _one_key_curve(cam_data, path, -1, "BB Stage handheld")
+        if fc is None:
+            continue
+        s = HANDHELD_SHIFT * amt * NOISE_GAIN * (1.0, 0.8)[k]
+        _set_noise(_noise_mod(fc, 0), s, 2.2 * f, 100.0 * _jitter(cam_data.name, k, 3))
+        _set_noise(_noise_mod(fc, 1), s * 0.22, 0.33 * f, 100.0 * _jitter(cam_data.name, k, 4))
+
+
+def _handheld_update(self, context):
+    sc = getattr(context, "scene", None)
+    apply_handheld(self, fps(sc) if sc is not None else 24.0)
+
+
+# ------------------------------------------------------------------ a camera travels with a character (0.16)
+#
+# Sathya's shot division, 11 Oct 2026: "no relative movement between camera and Shefali, both move together
+# and stop together". The camera is parented to a hidden helper that sits on the character, so it keeps its
+# own framing and simply goes where the character goes. Parenting (not a constraint on the camera) is what
+# lets the camera still be moved, flown and keyed by hand on any frame.
+
+# 0.18, Aman 13 Oct 2026: "the Travels with camera setting should also affect rotation, so that I could make
+# the camera a Snorricam as well". Turns with them on: the helper copies the character's facing too, so the
+# camera is bolted to him — he stays put in frame and the maze swings past behind him, and when he turns his
+# head the camera swings around him, with him as the pivot.
+
+RIDE_ROLE = "ride"
+RIDE_CON = "BB Ride"
+RIDE_ROT = "BB Ride Turn"
+
+
+def ride_helper(cam):
+    p = cam.parent if cam is not None else None
+    return p if (p is not None and p.get(ROLE_KEY) == RIDE_ROLE) else None
+
+
+def ride_target(cam):
+    h = ride_helper(cam)
+    con = h.constraints.get(RIDE_CON) if h is not None else None
+    return con.target if con is not None else None
+
+
+def ride_turns(cam):
+    """True when the camera turns with whoever it travels with (a Snorricam), not only goes where they go."""
+    h = ride_helper(cam)
+    return h is not None and h.constraints.get(RIDE_ROT) is not None
+
+
+def ride_matrix(scene, target, turning, frame=None):
+    """Where the ride helper sits: on its character, turned with them when it is a Snorricam. Worked out from
+    the keys, not from an evaluated matrix — a depsgraph read here is only as fresh as the last update, and a
+    stale one silently collapses the camera onto the character."""
+    f = scene.frame_current if frame is None else frame
+    rot = Euler(keyed_rotation_at(target, f)) if turning else Euler((0.0, 0.0, 0.0))
+    return Matrix.LocRotScale(keyed_location_at(target, f), rot, Vector((1.0, 1.0, 1.0)))
+
+
+def set_ride_turn(scene, cam, on):
+    """Switch the turning on or off without the picture moving: whatever the camera is framing right now, it
+    keeps framing. From here on its beat poses are read against the character's facing."""
+    h = ride_helper(cam)
+    tgt = ride_target(cam)
+    if h is None or tgt is None or on == ride_turns(cam):
+        return
+    was = ride_matrix(scene, tgt, ride_turns(cam))
+    if on:
+        con = h.constraints.new('COPY_ROTATION')
+        con.name = RIDE_ROT
+        con.target = tgt
+    else:
+        h.constraints.remove(h.constraints[RIDE_ROT])
+    now = ride_matrix(scene, tgt, on)
+    cam.matrix_parent_inverse = now.inverted() @ was @ cam.matrix_parent_inverse
+
+
+def ride_world(scene, cam):
+    """Where the camera really is, from its own numbers: its basis, through the helper it rides. Object
+    matrix_world is whatever the last depsgraph evaluation left there — on a camera made a moment ago it is
+    still the identity, which used to drop a new ride on top of its character."""
+    h = ride_helper(cam)
+    if h is None:
+        return cam.matrix_basis.copy()
+    tgt = ride_target(cam)
+    base = ride_matrix(scene, tgt, ride_turns(cam)) if tgt is not None else Matrix.Translation(h.location)
+    return base @ cam.matrix_parent_inverse @ cam.matrix_basis
+
+
+def set_ride(scene, cam, target):
+    """The camera travels with this character or prop from where both are now (None: it stands free again,
+    where it is now)."""
+    h = ride_helper(cam)
+    world = ride_world(scene, cam)
+    if target is None:
+        if h is not None:
+            turned = ride_turns(cam)
+            cam.parent = None
+            cam.matrix_parent_inverse = Matrix.Identity(4)
+            cam.location = world.to_translation()
+            if turned:          # it was bolted to somebody: its facing was theirs, keep what we see
+                cam.rotation_euler = world.to_euler('XYZ', cam.rotation_euler)
+            bpy.data.objects.remove(h)
+        return
+    if h is None:
+        h = bpy.data.objects.new(f"Ride · {cam.name}", None)
+        h[ROLE_KEY] = RIDE_ROLE
+        h.empty_display_size = 0.1
+        h.hide_render = True
+        h.hide_select = True
+        coll = sub_coll(scene, "STAGE", "Cameras") or scene.collection
+        coll.objects.link(h)
+        h.constraints.new('COPY_LOCATION').name = RIDE_CON
+    h.constraints[RIDE_CON].target = target
+    turn = h.constraints.get(RIDE_ROT)
+    if turn is not None:
+        turn.target = target                         # a Snorricam handed to somebody else turns with them
+    at = keyed_location_at(target, scene.frame_current)
+    h.location = at                                  # where the helper rests should its character ever go
+    if turn is None:
+        off = world.to_translation() - cam.location  # a camera that already travels keeps its picture
+        cam.parent = h
+        cam.matrix_parent_inverse = Matrix.Translation(off - at)
+    else:
+        cam.parent = h
+        cam.matrix_parent_inverse = ride_matrix(scene, target, True).inverted() @ world @ cam.matrix_basis.inverted()
+
+
+def clear_rides_of(scene, target):
+    for cam in stage_cams(scene):
+        if ride_target(cam) == target:
+            set_ride(scene, cam, None)
+
+
+# ------------------------------------------------------------------ where a camera looks (0.18)
+#
+# Aman, 13 Oct 2026: "in beat B3, Cam to Jai, I want the camera to point towards Jai and track Jai while it is
+# moving ... we can just keyframe the camera in one beat where the camera is looking at one point and then the
+# other ... ideally we should be able to keyframe the camera itself to where to look or track something."
+#
+# So every camera has one aim point, "Aim · <camera>": a hidden empty it points at. The aim is a pose like any
+# other — put it somewhere on a beat and Save Beat — and it can be told to ride a character or a prop, in which
+# case the camera tracks them live, wherever the blocking takes them. Which it rides is part of the beat too, so
+# a camera can hold on Jai, then let go and look at a spot, then pick up Shefali, all in one shot. Switching
+# between two people slides the aim from one to the other over the move, so the camera pans instead of snapping.
+
+AIM_ROLE = "aim"
+LOOK_CON = "BB Look"               # on the camera: Track To, pointing at its aim
+AIM_CON = "BB Aim · "              # on the aim: Copy Location per character it can ride
+LOOK_KEY = "bb_st_look"            # on the camera: {beat uid: "" (a free point) | object name | "off"}
+LOOK_OFF = "off"                   # the camera is not pointing at anything: its own rotation keys rule
+AIM_HEAD = 1.55                    # a character is aimed at around the head, not the feet
+
+
+def aim_of(cam):
+    con = cam.constraints.get(LOOK_CON) if (cam is not None and cam.type == 'CAMERA') else None
+    tgt = con.target if con is not None else None
+    return tgt if (tgt is not None and tgt.get(ROLE_KEY) == AIM_ROLE) else None
+
+
+def look_table(cam):
+    """{beat uid: what this camera looks at on that beat}. Beats with no entry inherit the one before."""
+    rec = cam.get(LOOK_KEY) if cam is not None else None
+    try:
+        return {int(k): str(v) for k, v in dict(rec).items()}
+    except Exception:
+        return {}
+
+
+def look_at_beat(scene, cam, i):
+    """What the camera looks at on beat i, inheriting from the beats before it: None (nothing),
+    "" (its own aim point) or an object."""
+    table = look_table(cam)
+    if not table:
+        return None
+    val = None
+    for b in scene.bb_st.beats[:i + 1]:
+        if b.uid in table:
+            val = table[b.uid]
+    if val is None or val == LOOK_OFF:
+        return None
+    return bpy.data.objects.get(val) if val else ""
+
+
+def ensure_aim(scene, cam):
+    """The camera's aim point, made on demand and parked a few metres in front of it."""
+    aim = aim_of(cam)
+    if aim is None:
+        aim = bpy.data.objects.new(f"Aim · {cam.name}", None)
+        aim[ROLE_KEY] = AIM_ROLE
+        aim.empty_display_type = 'SPHERE'
+        aim.empty_display_size = 0.22
+        aim.hide_render = True
+        aim.show_in_front = True
+        (sub_coll(scene, "STAGE", "Cameras") or scene.collection).objects.link(aim)
+        fwd = (cam.matrix_world.to_3x3() @ Vector((0.0, 0.0, -1.0))).normalized()
+        aim.location = cam.matrix_world.translation + fwd * 4.0
+        con = cam.constraints.get(LOOK_CON) or cam.constraints.new('TRACK_TO')
+        con.name = LOOK_CON
+        con.target = aim
+        con.track_axis, con.up_axis = 'TRACK_NEGATIVE_Z', 'UP_Y'
+        con.influence = 0.0
+        while cam.constraints.find(LOOK_CON) < len(cam.constraints) - 1:
+            cam.constraints.move(cam.constraints.find(LOOK_CON), len(cam.constraints) - 1)
+    aim.name = f"Aim · {cam.name}"
+    return aim
+
+
+def set_look(scene, cam, i, target):
+    """On this beat the camera looks at: an object (it tracks it, wherever it goes), "" (its own aim point,
+    which is a pose you place), or None (nothing — its own rotation keys rule again)."""
+    if cam is None or cam.type != 'CAMERA' or not len(scene.bb_st.beats):
+        return
+    uid = scene.bb_st.beats[i].uid
+    table = look_table(cam)
+    table[uid] = LOOK_OFF if target is None else (target.name if hasattr(target, "name") else "")
+    cam[LOOK_KEY] = {str(k): v for k, v in table.items()}
+    if target is not None:
+        aim = ensure_aim(scene, cam)
+        if hasattr(target, "name"):
+            name = AIM_CON + target.name
+            con = aim.constraints.get(name)
+            if con is None:
+                con = aim.constraints.new('COPY_LOCATION')
+                con.name = name
+                con.target = target
+                con.use_offset = True
+                con.influence = 0.0
+            aim.location = (0.0, 0.0, AIM_HEAD if target.get(ROLE_KEY) == "char" else 0.0)
+        else:
+            here = _evaluated_matrix(aim, _scene_depsgraph(scene)).translation   # it stays where it was aiming
+            poses = sample_beat_poses(scene)
+            rows = poses.get(aim.name)
+            if rows is not None:
+                for k in range(3):
+                    rows[i][("location", k)] = here[k]
+                    for j in range(i + 1, len(rows)):
+                        rows[j][("location", k)] = here[k]
+                write_beat_layout(scene, poses)
+            aim.location = here
+    apply_look(scene)
+
+
+def apply_look(scene):
+    """Write every camera's look from its beat table: the Track To fades in over the move into the beat it
+    starts on and out again where it stops, and the aim rides whoever that beat names. Rebuilt from the table
+    on every save and retime, so it follows the beats around."""
+    st = scene.bb_st
+    if not len(st.beats):
+        return
+    layout = [(b.frame, beat_out(b)) for b in st.beats]
+    for cam in stage_cams(scene):
+        table = look_table(cam)
+        con = cam.constraints.get(LOOK_CON)
+        if not table:
+            if con is not None:
+                _drop_fcurves(cam, {f'constraints["{LOOK_CON}"].influence'})
+                con.influence = 0.0
+            continue
+        aim = ensure_aim(scene, cam)
+        state = [None] * len(st.beats)              # what each beat looks at, inherited forward
+        cur = None
+        for i, b in enumerate(st.beats):
+            if b.uid in table:
+                cur = table[b.uid]
+            state[i] = cur
+        # the camera's Track To: on wherever the beat names anything at all
+        on = [bool(s is not None and s != LOOK_OFF) for s in state]
+        keys = []
+        for i, b in enumerate(st.beats):
+            a = layout[i][0]
+            if i == 0:
+                keys.append((a, 1.0 if on[0] else 0.0))
+            elif on[i] != on[i - 1]:
+                keys.append((layout[i - 1][1], 0.0 if on[i] else 1.0))     # it swings over during the move
+                keys.append((a, 1.0 if on[i] else 0.0))
+        _write_keys(cam, f'constraints["{LOOK_CON}"].influence', keys, 'BEZIER')
+        # the aim: riding whoever this beat names, or sitting on its own keys
+        riders = {s for s in state if s not in (None, LOOK_OFF, "")}
+        for name in riders:
+            tgt = bpy.data.objects.get(name)
+            cname = AIM_CON + name
+            c = aim.constraints.get(cname)
+            if tgt is None:
+                if c is not None:
+                    aim.constraints.remove(c)
+                continue
+            if c is None:
+                c = aim.constraints.new('COPY_LOCATION')
+                c.name = cname
+                c.target = tgt
+                c.use_offset = True
+            rows = []
+            for i, b in enumerate(st.beats):
+                want = 1.0 if state[i] == name else 0.0
+                a = layout[i][0]
+                if i == 0:
+                    rows.append((a, want))
+                elif (state[i] == name) != (state[i - 1] == name):
+                    rows.append((layout[i - 1][1], 1.0 - want))
+                    rows.append((a, want))
+            _write_keys(aim, f'constraints["{cname}"].influence', rows, 'BEZIER')
+        for c in list(aim.constraints):             # a target nobody looks at any more
+            if c.name.startswith(AIM_CON) and c.name[len(AIM_CON):] not in riders:
+                _drop_fcurves(aim, {f'constraints["{c.name}"].influence'})
+                aim.constraints.remove(c)
+
+
+# ------------------------------------------------------------------ a camera in a character's eyes (0.17)
+#
+# Aman, 12 Oct 2026, the Gossip Maze: "we cut to a camera that is basically Jai's POV ... he turns 180° and
+# the camera slightly drifts and somehow comes on Jai's front face." A point of view that becomes a shot of
+# the person whose point of view it was is two cameras' worth of hand-keying, and the hand-off is where it
+# always falls apart. Here it is one camera: it copies a hidden helper sitting in the character's eyes (the
+# gaze is posed on the beats like any other pose), and at a beat you choose it lets go over a second or so
+# and flies to wherever you parked it on the next beat. It leaves from the pose it was already in, so there
+# is nothing to pop, and both ends stay yours to move.
+
+EYES_ROLE = "eyes"
+EYES_CON = "BB Eyes"
+EYES_KEY = "bb_st_eyes"            # on the camera: [step-off beat uid, seconds] (uid 0: it never steps off)
+EYES_INF = f'constraints["{EYES_CON}"].influence'
+STEP_OFF_S = 0.8                   # how long the camera takes to leave the eyes, unless told otherwise
+EYES_DROP = 0.12                   # the eyes sit this far below the top of the head
+EYES_FWD = 0.35                    # and this far in front of it, so the peg's own head is never in shot
+                                   # (the same step the eyeline button in the Cast list takes)
+
+
+def eyes_helper(cam):
+    con = cam.constraints.get(EYES_CON) if (cam is not None and cam.type == 'CAMERA') else None
+    tgt = con.target if con is not None else None
+    return tgt if (tgt is not None and tgt.get(ROLE_KEY) == EYES_ROLE) else None
+
+
+def eyes_target(cam):
+    """The character whose eyes this camera is in (None: it is a camera of its own)."""
+    h = eyes_helper(cam)
+    return h.parent if h is not None else None
+
+
+def eyes_aims(cam):
+    """True when the eyes also decide where the camera points (the 0.17 rig). From 0.18 the eyes only carry
+    the camera and the aim is its own, so it can be keyed or given a Looks at."""
+    con = cam.constraints.get(EYES_CON) if (cam is not None and cam.type == 'CAMERA') else None
+    return con is not None and con.type == 'COPY_TRANSFORMS'
+
+
+def eyes_of(scene, char):
+    for ob in stage_objects(scene, roles=(EYES_ROLE,)):
+        if ob.parent == char:
+            return ob
+    return None
+
+
+def ensure_eyes_helper(scene, char):
+    """The helper that sits in a character's eyes, looking where he faces. One per character: several
+    cameras can be in the same pair of eyes."""
+    h = eyes_of(scene, char)
+    if h is None:
+        h = bpy.data.objects.new(f"Eyes · {char.name}", None)
+        h[ROLE_KEY] = EYES_ROLE
+        h.empty_display_type = 'PLAIN_AXES'
+        h.empty_display_size = 0.25
+        h.hide_render = True
+        h.show_in_front = True
+        (sub_coll(scene, "STAGE", "Cameras") or scene.collection).objects.link(h)
+        h.parent = char
+        h.matrix_parent_inverse = Matrix.Identity(4)
+        h.location = (0.0, EYES_FWD, max(0.3, peg_height_of(char) - EYES_DROP))
+        h.rotation_euler = (math.pi / 2, 0.0, 0.0)      # a camera that copies it looks where the character faces
+        for b in scene.bb_st.beats:
+            for f in sorted({b.frame, beat_out(b)}):
+                h.keyframe_insert("location", frame=f, group="BB Stage")
+                h.keyframe_insert("rotation_euler", frame=f, group="BB Stage")
+    h.name = f"Eyes · {char.name}"
+    return h
+
+
+def set_eyes(scene, cam, char):
+    """The camera sits in this character's eyes (None: it comes out and stays exactly where it is now)."""
+    if cam is None or cam.type != 'CAMERA':
+        return
+    con = cam.constraints.get(EYES_CON)
+    world = _evaluated_matrix(cam, _scene_depsgraph(scene))     # where it really is, constraint and all
+    if char is None:
+        uid, _secs = step_off(cam)
+        i = beat_index_of(scene.bb_st, uid) if uid else None
+        chans = {key: fc for key, fc in block_channels(cam).items() if key[0] in _BLOCK_PATHS}
+        ref = cam.rotation_euler.copy()
+        for b in scene.bb_st.beats[:(len(scene.bb_st.beats) if i is None else i + 1)]:
+            for fr in sorted({b.frame, beat_out(b)}):     # the shot it had in the eyes becomes its own poses
+                m = eyes_world(cam, fr)
+                if m is None:
+                    continue
+                loc, rot = m.to_translation(), m.to_euler('XYZ', ref)
+                ref = rot
+                for k in range(3):
+                    for path, v in (("location", loc[k]), ("rotation_euler", rot[k])):
+                        fc = chans.get((path, k))
+                        if fc is not None:
+                            _move_key(fc, fr, v)
+        for fc in chans.values():
+            fc.update()
+        if con is not None:
+            cam.constraints.remove(con)
+        _drop_fcurves(cam, {EYES_INF})
+        if EYES_KEY in cam:
+            del cam[EYES_KEY]
+        cam.location = world.to_translation()
+        cam.rotation_euler = world.to_euler('XYZ', cam.rotation_euler)
+        for h in stage_objects(scene, roles=(EYES_ROLE,)):      # nobody left in these eyes: the helper goes
+            if not any(eyes_helper(c) == h for c in stage_cams(scene)):
+                bpy.data.objects.remove(h)
+        return
+    set_ride(scene, cam, None)                   # a camera is either somebody's eyes or travels with somebody
+    h = ensure_eyes_helper(scene, char)
+    if con is None:
+        con = cam.constraints.new('COPY_LOCATION')   # 0.18: the eyes carry it, the aim stays its own
+        con.name = EYES_CON
+        cam.rotation_euler = world.to_euler('XYZ', cam.rotation_euler)
+    con.target = h
+    con.influence = 1.0
+    if not cam_moves(cam):
+        set_cam_moves(scene, cam, True)          # the pose it lands in is a beat pose like any other
+    cam[EYES_KEY] = [0, STEP_OFF_S]
+    apply_eyes(scene)
+
+
+def step_off(cam):
+    """(beat uid, seconds) of this camera's hand-off; uid 0: it stays in the eyes to the end."""
+    rec = cam.get(EYES_KEY) if cam is not None else None
+    try:
+        return int(rec[0]), float(rec[1])
+    except Exception:
+        return 0, STEP_OFF_S
+
+
+def set_step_off(scene, cam, uid=None, secs=None):
+    old_uid, old_s = step_off(cam)
+    cam[EYES_KEY] = [int(old_uid if uid is None else uid), float(max(0.1, old_s if secs is None else secs))]
+    if step_off(cam)[0] and not cam_moves(cam):
+        set_cam_moves(scene, cam, True)       # it needs beat poses to fly to once it lets go
+    apply_eyes(scene)
+
+
+def eyes_world(cam, frame):
+    """Where the camera sits and looks while it is in the eyes, on this frame — read from the keys, so no
+    playhead has to move to find out."""
+    h = eyes_helper(cam)
+    if h is None:
+        return None
+    m = Matrix.LocRotScale(keyed_location_at(h, frame), Euler(keyed_rotation_at(h, frame)), h.scale)
+    p = h.parent
+    if p is not None:
+        pm = Matrix.LocRotScale(keyed_location_at(p, frame), Euler(keyed_rotation_at(p, frame)), p.scale)
+        m = pm @ h.matrix_parent_inverse @ m
+    return m
+
+
+def _move_key(fc, frame, value):
+    """Put this curve's key on this frame at a value, handles and all (the blocking writes flat handles:
+    they travel with the key)."""
+    for kp in fc.keyframe_points:
+        if int(round(kp.co.x)) == int(frame):
+            dy = value - kp.co.y
+            kp.co.y = value
+            kp.handle_left.y += dy
+            kp.handle_right.y += dy
+            return
+    fc.keyframe_points.insert(float(frame), float(value))
+
+
+def apply_eyes(scene):
+    """Keep every POV camera in step with the beats: it holds the eyes until its step-off beat and is free a
+    second later, and its own pose on that one beat is the pose it has in the eyes — so when it lets go it is
+    already exactly where we were watching from, and only the flight to the next beat is left to show.
+    No other beat of the camera is touched: the pose you park for it to land on stays yours."""
+    st = scene.bb_st
+    f = fps(scene)
+    for cam in stage_cams(scene):
+        con = cam.constraints.get(EYES_CON)
+        if con is None or eyes_helper(cam) is None:
+            continue
+        uid, secs = step_off(cam)
+        i = beat_index_of(st, uid) if uid else None
+        _drop_fcurves(cam, {EYES_INF})
+        if i is None:
+            con.influence = 1.0
+            continue
+        b = st.beats[i]
+        chans = {key: fc for key, fc in block_channels(cam).items() if key[0] in _BLOCK_PATHS}
+        aims = con.type == 'COPY_TRANSFORMS'     # the 0.17 rig also decided where it pointed
+        ref = Euler(keyed_rotation_at(cam, b.frame))
+        for fr in sorted({b.frame, beat_out(b)}):
+            m = eyes_world(cam, fr)
+            if m is None:
+                continue
+            loc, rot = m.to_translation(), m.to_euler('XYZ', ref)
+            ref = rot
+            for k in range(3):
+                pairs = (("location", loc[k]), ("rotation_euler", rot[k])) if aims else (("location", loc[k]),)
+                for path, v in pairs:
+                    fc = chans.get((path, k))
+                    if fc is not None:
+                        _move_key(fc, fr, v)
+        for fc in chans.values():
+            fc.update()
+        f0 = b.frame
+        f1 = max(f0 + 1, f0 + int(round(max(0.1, secs) * f)))
+        for fr, v in ((f0, 1.0), (f1, 0.0)):
+            con.influence = v
+            cam.keyframe_insert(EYES_INF, frame=fr, group="BB Stage eyes")
+        fc = _curve(cam, EYES_INF)
+        for kp in (fc.keyframe_points if fc is not None else ()):
+            kp.interpolation = 'BEZIER'
+            kp.handle_left_type = kp.handle_right_type = 'AUTO_CLAMPED'     # it leaves gently and settles gently
+
+
+def set_zoom(scene, cam, on):
+    """Zoom on: the lens becomes part of every beat (change it on a beat and that beat keeps it), and the
+    camera moves on the beats. Off: one lens for the whole staging, the one it has now."""
+    if cam is None or cam.type != 'CAMERA':
+        return
+    st = scene.bb_st
+    if on:
+        if not cam_moves(cam):
+            set_cam_moves(scene, cam, True)
+        for b in st.beats:
+            for f in sorted({b.frame, beat_out(b)}):
+                cam.data.keyframe_insert("lens", frame=f, group="BB Stage")
+    elif lens_fcurve(cam) is not None:
+        lens = cam.data.lens
+        _drop_fcurves(cam.data, {"lens"})
+        cam.data.lens = lens
+
+
+def _lens_mm_set(self, v):
+    """The lens field of the panel and the pane header. On a camera that zooms, the beat at the playhead
+    takes the new lens (anywhere else the change would be lost on the next frame)."""
+    self.lens = float(min(300, max(8, v)))
+    if _curve(self, "lens") is None:
+        return
+    scene = getattr(bpy.context, "scene", None)
+    if scene is None or not is_staging(scene) or not len(scene.bb_st.beats):
+        return
+    i = beat_at_frame(scene)
+    if i is None:
+        return
+    b = scene.bb_st.beats[i]
+    for f in sorted({b.frame, beat_out(b)}):
+        self.keyframe_insert("lens", frame=f, group="BB Stage")
+    if scene.bb_st.natural:
+        rebuild_blocking(scene)
+
+
+def prune_moves(scene):
+    """Drop hand-set timings whose character or beat is gone."""
+    st = scene.bb_st
+    uids = {b.uid for b in list(st.beats)[1:]}
+    for k in reversed(range(len(st.moves))):
+        m = st.moves[k]
+        if m.owner is None or scene.objects.get(m.owner.name) != m.owner or m.beat_uid not in uids:
+            st.moves.remove(k)
 
 
 def relayout_beats(scene):
@@ -942,10 +2140,18 @@ def preview_follow(scene):
             a.tag_redraw()
 
 
+_PATH_FOCUS = {}        # scene name: the beat its paths are currently shown for
+
+
 def _bbst_on_frame(scene):
     try:
         if scene is not None and is_staging(scene):
             preview_follow(scene)
+            # the paths follow the playhead onto the beat it lands on — but never from in here:
+            # changing visibility inside a frame-change handler re-tags the depsgraph mid-evaluation
+            # and Blender 5.2 dies on it. Ask for a sync instead, which runs on a timer.
+            if len(scene.bb_st.paths) and _PATH_FOCUS.get(scene.name) != focus_beat(scene):
+                request_sync(0.0)
     except Exception as e:
         print("BB Stage preview:", e)
 
@@ -1011,14 +2217,15 @@ def beat_top_speed(scene, i):
     if i >= len(st.beats) - 1:
         return None
     f0, f1 = beat_out(st.beats[i]), st.beats[i + 1].frame
-    secs = (f1 - f0) / fps(scene)
-    if secs <= 0:
+    if f1 <= f0:
         return None
     worst = None
     for ob in stage_objects(scene, roles=("char",)):
         ad = ob.animation_data
         if not (ad and ad.action):
             continue
+        w0, w1 = move_window(scene, ob, i + 1)      # Natural moves: the part of the move it really walks in
+        secs = (w1 - w0) / fps(scene)
         p0, p1 = [0, 0], [0, 0]
         for fc in channelbag_fcurves(ad.action):
             if fc.data_path == "location" and fc.array_index in (0, 1):
@@ -1227,6 +2434,8 @@ def _face_path_update(rec, context):
         time_path(scene, rec, i)
         if rec.face_path:
             set_arrival_heading(scene, rec, i)
+        if scene.bb_st.natural:
+            rebuild_blocking(scene)
 
 
 def time_path(scene, rec, i):
@@ -1234,7 +2443,7 @@ def time_path(scene, rec, i):
     (a short start and stop, steady in between); the walker follows it from the frame after
     it leaves beat i-1 until it lands on beat i, and turns into and out of the path heading."""
     st = scene.bb_st
-    s, e = path_window(st, i)
+    s, e = move_window(scene, rec.owner, i)      # Natural moves: the walk can start late and land early
     span = e - s
     loc_n, rot_n = _con_names(rec.beat_uid)
     owner, fol = rec.owner, rec.follower
@@ -1286,26 +2495,33 @@ def path_heading_end(rec):
 
 
 def set_arrival_heading(scene, rec, i):
-    """The walker lands on beat i facing along the end of its path."""
+    """The walker lands on beat i facing along the end of its path. True when the heading changed."""
     if not rec.face_path:
-        return
+        return False
     th = path_heading_end(rec)
     ob = rec.owner
     ad = ob.animation_data
     fc = next((f for f in channelbag_fcurves(ad.action)
                if f.data_path == "rotation_euler" and f.array_index == 2), None) if (ad and ad.action) else None
     if th is None or fc is None:
-        return
+        return False
     b = scene.bb_st.beats[i]
     cur = fc.evaluate(b.frame)
     th = cur + ((th - cur + math.pi) % (2 * math.pi) - math.pi)      # the short way round
+    changed = False
     for f in sorted({b.frame, beat_out(b)}):
         kp = next((k for k in fc.keyframe_points if abs(k.co.x - f) < 0.5), None)
         if kp is None:
             fc.keyframe_points.insert(f, th)
+            changed = True
         elif abs(kp.co.y - th) > 1e-5:
+            d = th - kp.co.y
             kp.co.y = th
+            kp.handle_left.y += d       # a flat handle stays flat
+            kp.handle_right.y += d
+            changed = True
     fc.update()
+    return changed
 
 
 def _set_path_shape(rec, p0, mid, p1):
@@ -1379,6 +2595,7 @@ def create_path(scene, ob, i):
     _set_path_shape(rec, p0, _start_shape(ob, p0, p1), p1)
     time_path(scene, rec, i)
     set_arrival_heading(scene, rec, i)
+    apply_path_focus(scene)
     return rec
 
 
@@ -1427,8 +2644,9 @@ def refresh_paths(scene, edited=()):
     ends on the beat poses, re-key the timing, face the arrival along the path. Writes only
     what changed, so it is safe to run often."""
     if not is_staging(scene):
-        return
+        return False
     st = scene.bb_st
+    turned = False
     if len(st.paths):
         ensure_beat_uids(scene)
     for k in reversed(range(len(st.paths))):
@@ -1442,7 +2660,7 @@ def refresh_paths(scene, edited=()):
         editing = rec.curve.mode == 'EDIT'
         moved = False if editing else fit_path(scene, rec, i)
         if not editing and (moved or rec.curve.name in edited):
-            set_arrival_heading(scene, rec, i)
+            turned = bool(set_arrival_heading(scene, rec, i)) or turned
         time_path(scene, rec, i)
         if _rgba_differs(rec.curve.color, path_color(rec.owner)):
             rec.curve.color = path_color(rec.owner)
@@ -1452,6 +2670,43 @@ def refresh_paths(scene, edited=()):
         if rec.follower.name != fname and bpy.data.objects.get(fname) is None:
             rec.follower.name = fname
     _strip_stray_path_constraints(scene)
+    apply_path_focus(scene)
+    return turned
+
+
+def focus_beat(scene):
+    """The beat the paths are shown for: the one the playhead sits on, or the one being moved into."""
+    st = scene.bb_st
+    f = scene.frame_current
+    for i, b in enumerate(st.beats):
+        if f <= beat_out(b) + 0.5:
+            return i
+    return len(st.beats) - 1 if len(st.beats) else None
+
+
+def apply_path_focus(scene):
+    """Aman, 13 Oct 2026: "whenever I select a beat, the paths that lead to that beat from the last beat
+    should be visible ... the paths for the rest of the beats should disappear". With Paths: all, every
+    drawn move is shown at once, which is how it was before.
+
+    Never call this from a frame-change handler: it changes visibility, which re-tags the depsgraph."""
+    st = scene.bb_st
+    if not len(st.paths):
+        return
+    i = focus_beat(scene)
+    _PATH_FOCUS[scene.name] = i
+    uid = st.beats[i].uid if (i is not None and i < len(st.beats)) else None
+    for rec in st.paths:
+        show = (not st.path_focus) or rec.beat_uid == uid
+        for ob in (rec.curve, rec.follower):
+            if ob is not None and ob.hide_viewport != (not show):
+                ob.hide_viewport = not show
+
+
+def _path_focus_update(self, context):
+    scene = self.id_data
+    if isinstance(scene, bpy.types.Scene) and is_staging(scene):
+        apply_path_focus(scene)
 
 
 def tick_paths(scene):
@@ -1466,13 +2721,33 @@ def tick_paths(scene):
         elif c.name in _PATH_EDITING:
             _PATH_EDITING.discard(c.name)
             edited.add(c.name)
-    refresh_paths(scene, edited)
+    if refresh_paths(scene, edited) or (edited and scene.bb_st.natural):
+        rebuild_blocking(scene)         # a reshaped path: another length, another arrival heading
 
 
 # ------------------------------------------------------------------ properties
 
+def _caption_redraw(self, context):
+    scr = getattr(context, "screen", None)
+    for a in (scr.areas if scr else []):
+        if a.type == "VIEW_3D":
+            a.tag_redraw()
+
+
 def _black_outside_update(self, context):
     apply_passepartout(context.scene)   # defined further down; resolved at call time
+
+
+def _natural_update(self, context):
+    scene = self.id_data
+    if isinstance(scene, bpy.types.Scene) and is_staging(scene):
+        rebuild_blocking(scene)
+
+
+def _alive_update(self, context):
+    scene = self.id_data
+    if isinstance(scene, bpy.types.Scene) and is_staging(scene):
+        apply_alive(scene)
 
 
 class BBST_Beat(bpy.types.PropertyGroup):
@@ -1485,7 +2760,7 @@ class BBST_Beat(bpy.types.PropertyGroup):
     hold_s: bpy.props.FloatProperty(name="Hold (s)", default=0.0, min=0.0, soft_max=30.0, step=50,
                                     precision=1, update=_beat_time_update,
                                     description="Seconds everyone stays on this beat before moving to the next")
-    note: bpy.props.StringProperty(name="Note", default="")
+    note: bpy.props.StringProperty(name="Note", default="", update=_caption_redraw)
     dirty: bpy.props.BoolProperty(default=False)   # something moved on this beat and isn't saved
     uid: bpy.props.IntProperty(default=0)          # lasting id (paths hold on to it)
 
@@ -1502,6 +2777,22 @@ class BBST_Path(bpy.types.PropertyGroup):
                     "set on the beats while travelling the path")
 
 
+class BBST_Move(bpy.types.PropertyGroup):
+    """Natural moves: the timing of one move (this character, prop or camera into this beat), set by hand."""
+    owner: bpy.props.PointerProperty(type=bpy.types.Object)
+    beat_uid: bpy.props.IntProperty(default=0)
+    start_s: bpy.props.FloatProperty(
+        name="Starts after (s)", default=0.0, min=0.0, soft_max=20.0, step=10, precision=2, update=_natural_update,
+        description="Seconds it waits after the previous beat lets go before it starts to move")
+    end_s: bpy.props.FloatProperty(
+        name="Lands early (s)", default=0.0, min=0.0, soft_max=20.0, step=10, precision=2, update=_natural_update,
+        description="Seconds before the beat at which it has arrived and settled")
+    face: bpy.props.EnumProperty(name="Facing", update=_natural_update, default='AUTO', items=[
+        ('AUTO', "Facing: auto", "A walk faces where it goes; a step of about a metre keeps its facing"),
+        ('ALONG', "Faces where it goes", "Turn to the direction of travel, go, then turn to the final facing"),
+        ('KEEP', "Keeps its facing", "Turn straight from the old facing to the new one: a sidestep, backing away")])
+
+
 def _beat_index_update(self, context):
     """Clicking a beat row jumps the whole scene to that beat. Unsaved moves on the beat being
     left are saved first: the jump re-reads the keys and would wipe them."""
@@ -1512,6 +2803,7 @@ def _beat_index_update(self, context):
         if cur is not None and st.beats[cur].dirty:
             save_beat(scene, cur)      # also when re-clicking the active beat: frame_set re-reads the keys
         scene.frame_set(st.beats[st.beat_index].frame)
+        apply_path_focus(scene)        # the paths of the beat we land on, and only those
 
 
 def _use_floors_update(self, context):
@@ -1582,6 +2874,31 @@ class BBST_Props(bpy.types.PropertyGroup):
     beat_spacing: bpy.props.FloatProperty(name="Default move time (s)", default=3.0, min=0.0, max=60,
                                           description="How long the move into a new beat takes")
     key_cameras: bpy.props.BoolProperty(name="Key cameras on beats", default=False)
+    natural: bpy.props.BoolProperty(
+        name="Natural moves", default=False, update=_natural_update,
+        description="Everybody takes the time their own move needs instead of the whole Move time: they set off a "
+                    "little after each other, walk at the walking pace, turn to where they go and settle before the "
+                    "beat. Off: everybody eases over the whole move together (0.15 and earlier)")
+    pace: bpy.props.FloatProperty(
+        name="Walking pace (m/s)", default=1.3, min=0.3, max=6.0, step=10, precision=1, update=_natural_update,
+        description="Natural moves: how fast people walk when the Move time leaves them the choice (a stroll is 1, "
+                    "a brisk walk 1.6). A move too short for the distance still makes them hurry")
+    alive: bpy.props.FloatProperty(
+        name="Life in the holds", default=0.0, min=0.0, max=3.0, step=10, precision=1, update=_alive_update,
+        description="Characters never stand like statues: their facing drifts a little, each in its own slow rhythm. "
+                    "0 is off, 1 is subtle, 3 is restless")
+    path_focus: bpy.props.BoolProperty(
+        name="Paths: this beat only", default=True, update=_path_focus_update,
+        description="Show only the drawn moves that lead into the beat the playhead is on — everybody's, cameras "
+                    "included. Off: every path in the staging is drawn at once")
+    carry_set: bpy.props.BoolProperty(
+        name="Retime the set animation too", default=False,
+        description="A change of a Move or Hold time also moves the keys of animated set objects (a collapsing "
+                    "building timed to a beat). Leave off when other stagings share that animation")
+    moves: bpy.props.CollectionProperty(type=BBST_Move)
+    show_captions: bpy.props.BoolProperty(name="Caption in the preview pane", default=True, update=_caption_redraw,
+                                          description="Show the label and note of the beat at the playhead along the bottom of the "
+                                                      "preview pane. On screen only, never in a playblast")
     black_outside: bpy.props.BoolProperty(name="Black outside camera", default=True,
                                           update=_black_outside_update,
                                           description="Camera panes show nothing outside the frame")
@@ -1611,6 +2928,7 @@ class BBST_Props(bpy.types.PropertyGroup):
         default='BEATS')
     char_index: bpy.props.IntProperty(default=0, update=lambda self, ctx: _select_row(ctx, "Characters", self.char_index))
     prop_index: bpy.props.IntProperty(default=0, update=lambda self, ctx: _select_row(ctx, "Props", self.prop_index))
+    cam_index: bpy.props.IntProperty(default=0, update=lambda self, ctx: _select_row(ctx, "Cameras", self.cam_index))
     new_char_name: bpy.props.StringProperty(name="Name", default="")
     next_color: bpy.props.IntProperty(default=0)
     # ---- v0.8: robust references (per staging)
@@ -2098,6 +3416,8 @@ class BBST_OT_new_staging(bpy.types.Operator):
         if self.use_floors:
             st.active_level = level
         st.data_version = DATA_VERSION
+        st["natural"] = True            # new stagings move naturally (0.16); older ones keep how they were made
+        st["alive"] = 1.0
         # studio space: middle of the set, standing on this level's floor
         centre = set_bounds_center(sc)
         bound = build_boundary_object(label, st.studio_w, st.studio_d, st.studio_h)
@@ -2599,7 +3919,14 @@ class BBST_OT_obj_action(bpy.types.Operator):
         elif self.action == 'DELETE':
             sc = context.scene
             was_cam = ob.type == 'CAMERA'
+            if is_staging(sc):
+                if was_cam:
+                    set_ride(sc, ob, None)          # its helper goes with it
+                else:
+                    clear_rides_of(sc, ob)          # cameras that travelled with it stand free, where they are
             bpy.data.objects.remove(ob)
+            if is_staging(sc):
+                prune_moves(sc)
             if was_cam and is_staging(sc) and sc.camera is None:
                 cams = stage_cams(sc)
                 if cams:
@@ -2767,6 +4094,7 @@ class BBST_OT_beat_goto(bpy.types.Operator):
         if 0 <= self.index < len(st.beats):
             st.beat_index = self.index
             scene.frame_set(st.beats[self.index].frame)
+            apply_path_focus(scene)
         return {'FINISHED'}
 
 
@@ -2811,6 +4139,38 @@ class BBST_OT_beat_delete(bpy.types.Operator):
                 _QUIET["beats"] = False
         st.beat_index = max(0, i - 1)
         sync_markers(scene)
+        prune_moves(scene)
+        return {'FINISHED'}
+
+
+class BBST_OT_move_timing(bpy.types.Operator):
+    """Natural moves works out when the selected character sets off and lands. Set by Hand: choose both yourself for this one move. Back to Auto: let Natural moves decide again"""
+    bl_idname = "bbst.move_timing"
+    bl_label = "Move Timing"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    action: bpy.props.EnumProperty(items=[('HAND', "Set by Hand", ""), ('AUTO', "Back to Auto", "")])
+
+    def execute(self, context):
+        scene = context.scene
+        st = scene.bb_st
+        owner = _path_owner(context)
+        i = _clamped_beat(st) if len(st.beats) else 0
+        if owner is None or not i:
+            return {'CANCELLED'}
+        uid = st.beats[i].uid
+        k = next((k for k, m in enumerate(st.moves) if m.owner == owner and m.beat_uid == uid), None)
+        if self.action == 'AUTO':
+            if k is not None:
+                st.moves.remove(k)
+        elif k is None:
+            s, e = path_window(st, i)
+            s2, e2 = move_window(scene, owner, i)
+            m = st.moves.add()
+            m.owner, m.beat_uid = owner, uid
+            m["start_s"] = round((s2 - s) / fps(scene), 2)      # starts from what Auto gave it
+            m["end_s"] = round((e - e2) / fps(scene), 2)
+        rebuild_blocking(scene)
         return {'FINISHED'}
 
 
@@ -2871,6 +4231,8 @@ def _finish_path_edit(context, rec):
         time_path(scene, rec, i)
     if rec.curve is not None:
         _PATH_EDITING.discard(rec.curve.name)
+    if scene.bb_st.natural:
+        rebuild_blocking(scene)
 
 
 class BBST_OT_path_add(bpy.types.Operator):
@@ -2880,6 +4242,9 @@ class BBST_OT_path_add(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
+        if ride_helper(_path_owner(context)) is not None:
+            self.report({'ERROR'}, "This camera travels with a character: set Travels with to Nobody before drawing it a path")
+            return {'CANCELLED'}
         scene = context.scene
         st = scene.bb_st
         ob = _path_owner(context)
@@ -3200,6 +4565,248 @@ class BBST_OT_cam_moves(bpy.types.Operator):
         return {'FINISHED'}
 
 
+_RIDE_ENUM_CACHE = []
+
+
+def _ride_enum_items(self, context):
+    global _RIDE_ENUM_CACHE
+    scene = context.scene if context else None
+    obs = stage_objects(scene, roles=("char", "prop")) if (scene is not None and is_staging(scene)) else []
+    _RIDE_ENUM_CACHE = [('NONE', "Nobody (stands free)", "The camera stays where the beats put it")]
+    _RIDE_ENUM_CACHE += [(o.name, o.name, f"The camera goes wherever {o.name} goes, keeping its own framing") for o in obs]
+    return _RIDE_ENUM_CACHE
+
+
+class BBST_OT_cam_ride(bpy.types.Operator):
+    """The camera travels with a character: it keeps its own framing and goes wherever the character goes (a follow shot, a game camera locked to a player). Frame it on any frame as usual"""
+    bl_idname = "bbst.cam_ride"
+    bl_label = "Camera Travels With"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    cam_name: bpy.props.StringProperty()
+    target: bpy.props.EnumProperty(items=_ride_enum_items)
+
+    def execute(self, context):
+        scene = context.scene
+        cam = bpy.data.objects.get(self.cam_name)
+        if cam is None or cam not in stage_cams(scene):
+            return {'CANCELLED'}
+        tgt = bpy.data.objects.get(self.target) if self.target != 'NONE' else None
+        if tgt is not None and any(r.owner == cam for r in scene.bb_st.paths):
+            self.report({'ERROR'}, f"{cam.name} has a drawn path: remove it first, a camera either travels its own path or with somebody")
+            return {'CANCELLED'}
+        set_ride(scene, cam, tgt)
+        request_sync(0.0)
+        return {'FINISHED'}
+
+
+_EYES_ENUM_CACHE = []
+_STEP_ENUM_CACHE = []
+
+
+def _eyes_enum_items(self, context):
+    global _EYES_ENUM_CACHE
+    scene = context.scene if context else None
+    obs = stage_objects(scene, roles=("char",)) if (scene is not None and is_staging(scene)) else []
+    _EYES_ENUM_CACHE = [('NONE', "Nobody (a camera of its own)", "The camera stays where the beats put it")]
+    _EYES_ENUM_CACHE += [(o.name, o.name, f"The camera is {o.name}'s eyes: it sees what he sees") for o in obs]
+    return _EYES_ENUM_CACHE
+
+
+def _step_enum_items(self, context):
+    global _STEP_ENUM_CACHE
+    scene = context.scene if context else None
+    beats = scene.bb_st.beats if (scene is not None and is_staging(scene)) else []
+    _STEP_ENUM_CACHE = [('0', "Never (stays in the eyes)", "The camera is his point of view to the end of the shot")]
+    _STEP_ENUM_CACHE += [(str(b.uid), f"B{i + 1}" + (f" {b.label}" if b.label else ""),
+                          "The camera leaves the eyes on this beat and flies to its pose on the next one")
+                         for i, b in enumerate(beats)]
+    return _STEP_ENUM_CACHE
+
+
+class BBST_OT_cam_eyes(bpy.types.Operator):
+    """The camera sits in a character's eyes: it sees what he sees and turns when he turns. Pose his gaze on a beat with the Gaze sliders, and let the camera step off at a beat to end the shot on his face"""
+    bl_idname = "bbst.cam_eyes"
+    bl_label = "Camera in the Eyes of"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    cam_name: bpy.props.StringProperty()
+    target: bpy.props.EnumProperty(items=_eyes_enum_items)
+
+    def execute(self, context):
+        scene = context.scene
+        cam = bpy.data.objects.get(self.cam_name)
+        if cam is None or cam not in stage_cams(scene):
+            return {'CANCELLED'}
+        char = bpy.data.objects.get(self.target) if self.target != 'NONE' else None
+        if char is not None and any(r.owner == cam for r in scene.bb_st.paths):
+            self.report({'ERROR'}, f"{cam.name} has a drawn path: remove it first, a camera either flies its own path or rides in somebody's eyes")
+            return {'CANCELLED'}
+        set_eyes(scene, cam, char)
+        request_sync(0.0)
+        return {'FINISHED'}
+
+
+class BBST_OT_cam_ride_turn(bpy.types.Operator):
+    """Snorricam: the camera turns with whoever it travels with, not only goes where they go. He stays put in frame and the set swings past behind him, and when he turns, the camera swings around him. The picture it has right now is kept"""
+    bl_idname = "bbst.cam_ride_turn"
+    bl_label = "Turns With Them"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    cam_name: bpy.props.StringProperty()
+    on: bpy.props.BoolProperty(default=True)
+
+    def execute(self, context):
+        scene = context.scene
+        cam = bpy.data.objects.get(self.cam_name)
+        if cam is None or ride_target(cam) is None:
+            return {'CANCELLED'}
+        set_ride_turn(scene, cam, self.on)
+        request_sync(0.0)
+        return {'FINISHED'}
+
+
+_LOOK_ENUM_CACHE = []
+
+
+def _look_enum_items(self, context):
+    global _LOOK_ENUM_CACHE
+    scene = context.scene if context else None
+    obs = stage_objects(scene, roles=("char", "prop")) if (scene is not None and is_staging(scene)) else []
+    _LOOK_ENUM_CACHE = [
+        ('NONE', "Nothing (its own rotation)", "The camera points where its own beat poses point it"),
+        ('POINT', "Its aim point", "The camera points at its aim, which you place like any other pose — "
+                                   "move it on a beat and Save Beat"),
+    ]
+    _LOOK_ENUM_CACHE += [(o.name, o.name, f"The camera points at {o.name} and tracks them wherever they go")
+                         for o in obs]
+    return _LOOK_ENUM_CACHE
+
+
+class BBST_OT_cam_looks_at(bpy.types.Operator):
+    """What this camera points at from this beat on: nothing (its own rotation keys), its own aim point, or somebody it then tracks. It holds until another beat changes it, and it swings over during the move rather than snapping"""
+    bl_idname = "bbst.cam_looks_at"
+    bl_label = "Camera Looks At"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    cam_name: bpy.props.StringProperty()
+    target: bpy.props.EnumProperty(items=_look_enum_items)
+
+    def execute(self, context):
+        scene = context.scene
+        cam = bpy.data.objects.get(self.cam_name)
+        if cam is None or cam not in stage_cams(scene) or not len(scene.bb_st.beats):
+            return {'CANCELLED'}
+        if eyes_aims(cam):
+            self.report({'ERROR'}, f"{cam.name} points where {eyes_target(cam).name}'s eyes point: free its aim first")
+            return {'CANCELLED'}
+        i = _clamped_beat(scene.bb_st)
+        if self.target == 'NONE':
+            set_look(scene, cam, i, None)
+        elif self.target == 'POINT':
+            set_look(scene, cam, i, "")
+        else:
+            tgt = bpy.data.objects.get(self.target)
+            if tgt is None:
+                return {'CANCELLED'}
+            set_look(scene, cam, i, tgt)
+        request_sync(0.0)
+        return {'FINISHED'}
+
+
+class BBST_OT_cam_free_aim(bpy.types.Operator):
+    """Free this camera's aim from the eyes it sits in: it keeps its picture, but from now on it points where its own keys or its Looks at say, and the gaze sliders are gone"""
+    bl_idname = "bbst.cam_free_aim"
+    bl_label = "Free the Aim"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    cam_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        scene = context.scene
+        cam = bpy.data.objects.get(self.cam_name)
+        con = cam.constraints.get(EYES_CON) if cam is not None else None
+        if con is None or con.type != 'COPY_TRANSFORMS':
+            return {'CANCELLED'}
+        st = scene.bb_st
+        rots = {}                                   # the aim it has now, beat by beat, so nothing moves
+        for i, b in enumerate(st.beats):
+            m = eyes_world(cam, b.frame)
+            if m is not None:
+                rots[i] = m.to_euler('XYZ', Euler(keyed_rotation_at(cam, b.frame)))
+        loc = cam.constraints.new('COPY_LOCATION')
+        loc.name = EYES_CON + " tmp"
+        loc.target = con.target
+        cam.constraints.remove(con)
+        loc.name = EYES_CON
+        while cam.constraints.find(EYES_CON) > 0:
+            cam.constraints.move(cam.constraints.find(EYES_CON), 0)
+        poses = sample_beat_poses(scene)
+        rows = poses.get(cam.name)
+        if rows is not None:
+            for i, rot in rots.items():
+                for k in range(3):
+                    rows[i][("rotation_euler", k)] = rot[k]
+        write_beat_layout(scene, poses)
+        request_sync(0.0)
+        return {'FINISHED'}
+
+
+class BBST_OT_cam_step_off(bpy.types.Operator):
+    """The beat where the camera leaves the eyes. It lets go over the step-off time and flies to the pose you give it on the next beat — one shot, no cut, and it leaves from exactly the picture we were watching"""
+    bl_idname = "bbst.cam_step_off"
+    bl_label = "Steps Off At"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    cam_name: bpy.props.StringProperty()
+    beat: bpy.props.EnumProperty(items=_step_enum_items)
+
+    def execute(self, context):
+        scene = context.scene
+        cam = bpy.data.objects.get(self.cam_name)
+        if cam is None or eyes_helper(cam) is None:
+            return {'CANCELLED'}
+        set_step_off(scene, cam, uid=int(self.beat))
+        request_sync(0.0)
+        return {'FINISHED'}
+
+
+def _step_s_set(self, v):
+    scene = getattr(bpy.context, "scene", None)
+    if scene is not None and eyes_helper(self) is not None:
+        set_step_off(scene, self, secs=v)
+
+
+def _gaze_get(k, rest):
+    return lambda ob: float(ob.rotation_euler[k] - rest)
+
+
+def _gaze_setter(k, rest):
+    def _set(ob, v):
+        ob.rotation_euler[k] = float(v) + rest
+    return _set
+
+
+class BBST_OT_lens_key(bpy.types.Operator):
+    """Zoom: make this camera's lens part of the beats. Change the lens on a beat and that beat keeps it, so the camera zooms on its way there. Off: one lens for the whole staging"""
+    bl_idname = "bbst.lens_key"
+    bl_label = "Zoom on Beats"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    cam_name: bpy.props.StringProperty()
+    on: bpy.props.BoolProperty(default=True)
+
+    def execute(self, context):
+        scene = context.scene
+        cam = bpy.data.objects.get(self.cam_name)
+        if cam is None or cam not in stage_cams(scene) or not len(scene.bb_st.beats):
+            return {'CANCELLED'}
+        set_zoom(scene, cam, self.on)
+        if scene.bb_st.natural:
+            rebuild_blocking(scene)
+        return {'FINISHED'}
+
+
 class BBST_OT_rename(bpy.types.Operator):
     """Rename this camera"""
     bl_idname = "bbst.rename"
@@ -3475,8 +5082,8 @@ def visibility_plan(scene):
     for c in layer_colls(scene, "STAGE"):
         for ob in coll_objects(c):
             role = ob.get(ROLE_KEY)
-            if role == FOLLOWER_ROLE:
-                continue                # rides the path unseen
+            if role in (FOLLOWER_ROLE, RIDE_ROLE):
+                continue                # rides the path (or carries a camera) unseen
             if role == PATH_ROLE:
                 paths.add(ob.name)      # drawn in the plan only, never in a camera
                 continue
@@ -3591,6 +5198,7 @@ def sync_all():
                 win.scene = _last_staging(win) or ss[0]   # never the bare set: back to the last staging
                 request_sync(0.05)
             continue
+        apply_path_focus(scene)          # safe here: a timer, not the middle of a depsgraph evaluation
         sync_window(win, scene)
 
 
@@ -3833,7 +5441,7 @@ class BBST_OT_pane_lens(bpy.types.Operator):
         cam = pane_camera(context.scene, pane_role(context.window, context.area))
         if cam is None:
             return {'CANCELLED'}
-        cam.data.lens = self.mm
+        cam.data.bbst_lens_mm = int(round(self.mm))
         return {'FINISHED'}
 
 
@@ -3866,7 +5474,7 @@ class BBST_OT_lens_step(bpy.types.Operator):
             nxt = next((p for p in LENS_PRESETS if p > cur + 0.01), LENS_PRESETS[-1])
         else:
             nxt = next((p for p in reversed(LENS_PRESETS) if p < cur - 0.01), LENS_PRESETS[0])
-        cam.data.lens = nxt
+        cam.data.bbst_lens_mm = int(nxt)
         return {'FINISHED'}
 
 
@@ -5812,7 +7420,9 @@ def draw_path_box(lay, context):
     rec, i = _active_path(context)
     box = lay.box()
     col = box.column(align=True)
-    col.label(text=f"Path · {owner.name}", icon='CURVE_BEZCURVE')
+    row = col.row(align=True)
+    row.label(text=f"Path · {owner.name}", icon='CURVE_BEZCURVE')
+    row.prop(st, "path_focus", text="", icon='HIDE_OFF' if st.path_focus else 'HIDE_ON', toggle=True)
     if len(st.beats) < 2 or not i:
         col.label(text="Pick B2 or later: a path shapes the walk into that beat", icon='INFO')
     elif rec is None:
@@ -5835,7 +7445,7 @@ def draw_path_box(lay, context):
     if rec is not None and i and owner.get(ROLE_KEY) != "char":
         col.prop(rec, "face_path")
     if rec is not None and i:
-        s, e = path_window(st, i)
+        s, e = move_window(scene, owner, i)
         secs = (e - s) / fps(scene)
         length = path_length(rec)
         speed = length / secs if secs > 0 else 0.0
@@ -5850,6 +7460,39 @@ def draw_path_box(lay, context):
             row = col.row(align=True)
             row.label(text=f"Path into B{k + 1} · {path_length(r):.1f} m", icon='CURVE_PATH')
             row.operator("bbst.beat_goto", text="", icon='FORWARD').index = k
+
+
+def draw_move_box(lay, context):
+    """Natural moves, under the active beat: when the selected character (prop, moving camera) sets off and lands."""
+    scene = context.scene
+    st = scene.bb_st
+    if not st.natural or len(st.beats) < 2:
+        return
+    owner = _path_owner(context)
+    i = _clamped_beat(st)
+    if owner is None or not i or (owner.type == 'CAMERA' and not cam_moves(owner)):
+        return
+    f = fps(scene)
+    s, e = path_window(st, i)
+    s2, e2 = move_window(scene, owner, i)
+    rec = move_rec(scene, owner, st.beats[i].uid)
+    box = lay.box()
+    col = box.column(align=True)
+    col.label(text=f"Timing · {owner.name} into B{i + 1}", icon='TIME')
+    if rec is None:
+        if (s2, e2) == (s, e):
+            col.label(text=f"Auto: uses the whole {(e - s) / f:.1f} s")
+        else:
+            col.label(text=f"Auto: waits {(s2 - s) / f:.1f} s, moves {(e2 - s2) / f:.1f} s, lands {(e - e2) / f:.1f} s early")
+        col.operator("bbst.move_timing", text="Set by Hand", icon='GREASEPENCIL').action = 'HAND'
+    else:
+        row = col.row(align=True)
+        row.prop(rec, "start_s")
+        row.prop(rec, "end_s")
+        if owner.get(ROLE_KEY) == "char":
+            col.prop(rec, "face", text="")
+        col.label(text=f"Moves {(e2 - s2) / f:.1f} s of {(e - s) / f:.1f} s")
+        col.operator("bbst.move_timing", text="Back to Auto", icon='LOOP_BACK').action = 'AUTO'
 
 
 def draw_beats(lay, context):
@@ -5890,10 +7533,13 @@ def draw_beats(lay, context):
     if n:
         b = st.beats[idx]
         lay.prop(b, "note", text="", placeholder="What happens on this beat")
+        lay.prop(st, "show_captions")
         row = lay.row(align=True)
         row.operator("bbst.beat_delete", icon='X')
         row.operator("bbst.fit_range", icon='PREVIEW_RANGE')
+        lay.prop(st, "natural", toggle=True, icon='IPO_EASE_IN_OUT')
         draw_path_box(lay, context)
+        draw_move_box(lay, context)
         if n > 1:
             total = (beat_out(st.beats[-1]) - st.beats[0].frame) / fps(scene)
             warn = "" if 4 <= total <= 30 else "  (outside Seedance 4–30 s)"
@@ -5912,32 +7558,128 @@ def draw_beats(lay, context):
         lay.label(text="Place everyone, then Add Beat", icon='INFO')
 
 
+def _cam_row(row, context, ob):
+    scene = context.scene
+    active = context.view_layer.objects.active == ob and ob.select_get()
+    live = scene.camera == ob           # the camera the cuts show on this frame
+    op = row.operator("bbst.obj_action", text=ob.name, icon='VIEW_CAMERA' if live else 'OUTLINER_OB_CAMERA', depress=active)
+    op.obj_name, op.action = ob.name, 'SELECT'
+    row.operator("bbst.rename", text="", icon='GREASEPENCIL').obj_name = ob.name
+    sub = row.row(align=True)
+    sub.ui_units_x = 3
+    sub.prop(ob.data, "bbst_lens_mm", text="")     # whole millimetres, like the pane header
+    moves = scene.bb_st.key_cameras or cam_moves(ob)
+    op = row.operator("bbst.cam_moves", text="", icon='DECORATE_KEYFRAME' if moves else 'DECORATE_ANIMATE',
+                      depress=moves)
+    op.cam_name, op.on = ob.name, not moves
+    if _mode() == 'ARTIST':
+        row.operator("bbst.playblast", text="", icon='RENDER_ANIMATION').cam_name = ob.name
+    op = row.operator("bbst.obj_action", text="", icon='X')
+    op.obj_name = ob.name
+    op.action = 'DELETE'
+
+
+class BBST_UL_cams(bpy.types.UIList):
+    """The cameras of a staging. A staging cut into shots can hold dozens: the list scrolls and can be searched."""
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_prop, index):
+        _cam_row(layout.row(align=True), context, item)
+
+    def filter_items(self, context, data, propname):
+        obs = getattr(data, propname)
+        text = self.filter_name.lower()
+        flags = [self.bitflag_filter_item if (o.type == 'CAMERA' and (not text or text in o.name.lower())) else 0 for o in obs]
+        order = bpy.types.UI_UL_list.sort_items_by_name(obs, "name") if self.use_filter_sort_alpha else []
+        return flags, order
+
+
+CAM_LIST_FROM = 9           # more cameras than this: the list scrolls
+
+
 def draw_cams(lay, context):
     scene = context.scene
-    artist = _mode() == 'ARTIST'
     lay.operator("bbst.cam_add", icon='OUTLINER_OB_CAMERA')
-    for ob in stage_cams(scene):
-        row = lay.row(align=True)
-        active = context.view_layer.objects.active == ob and ob.select_get()
-        op = row.operator("bbst.obj_action", text=ob.name, icon='OUTLINER_OB_CAMERA', depress=active)
-        op.obj_name, op.action = ob.name, 'SELECT'
-        row.operator("bbst.rename", text="", icon='GREASEPENCIL').obj_name = ob.name
-        sub = row.row(align=True)
-        sub.ui_units_x = 3
-        sub.prop(ob.data, "bbst_lens_mm", text="")     # whole millimetres, like the pane header
-        moves = scene.bb_st.key_cameras or cam_moves(ob)
-        op = row.operator("bbst.cam_moves", text="", icon='DECORATE_KEYFRAME' if moves else 'DECORATE_ANIMATE',
-                          depress=moves)
-        op.cam_name, op.on = ob.name, not moves
-        if artist:
-            row.operator("bbst.playblast", text="", icon='RENDER_ANIMATION').cam_name = ob.name
-        op = row.operator("bbst.obj_action", text="", icon='X')
-        op.obj_name = ob.name
-        op.action = 'DELETE'
+    cams = stage_cams(scene)
+    coll = sub_coll(scene, "STAGE", "Cameras")
+    if coll is not None and len(cams) >= CAM_LIST_FROM:
+        lay.template_list("BBST_UL_cams", "", coll, "objects", scene.bb_st, "cam_index", rows=8)
+    else:
+        for ob in cams:
+            _cam_row(lay.row(align=True), context, ob)
+    cam = context.view_layer.objects.active if context.view_layer else None
+    if cam is None or cam.type != 'CAMERA' or cam not in stage_cams(scene):
+        cam = scene.camera if scene.camera in stage_cams(scene) else None      # nothing picked: the one in the preview
+    if cam is not None:
+        st = scene.bb_st
+        i = _clamped_beat(st) if len(st.beats) else None
+        box = lay.box()
+        col = box.column(align=True)
+        col.label(text=cam.name, icon='OUTLINER_OB_CAMERA')
+
+        # where it looks, on this beat
+        looks = look_at_beat(scene, cam, i) if i is not None else None
+        text = "Looks at: nothing (its own aim)" if looks is None else (
+            "Looks at: its aim point" if looks == "" else f"Looks at: {looks.name}")
+        row = col.row(align=True)
+        row.enabled = i is not None
+        op = row.operator_menu_enum("bbst.cam_looks_at", "target", icon='CON_TRACKTO', text=text)
+        op.cam_name = cam.name
+        if looks is not None and aim_of(cam) is not None:
+            op = row.operator("bbst.obj_action", text="", icon='RESTRICT_SELECT_OFF')
+            op.obj_name, op.action = aim_of(cam).name, 'SELECT'
+        if i is not None and i > 0 and looks is not None:
+            sub = col.row()
+            sub.enabled = False
+            sub.label(text="Set on this beat; it holds until a beat changes it", icon='INFO')
+
+        col.prop(cam.data, "bbst_handheld", slider=True)
+        tgt = ride_target(cam)
+        op = col.operator_menu_enum("bbst.cam_ride", "target", icon='CON_FOLLOWPATH',
+                                    text=f"Travels with: {tgt.name}" if tgt is not None else "Travels with: nobody")
+        op.cam_name = cam.name
+        if tgt is not None:
+            turns = ride_turns(cam)
+            op = col.operator("bbst.cam_ride_turn", depress=turns, icon='ORIENTATION_GIMBAL',
+                              text=f"Turns with {tgt.name} too — Snorricam" if turns
+                                   else f"Goes where {tgt.name} goes, keeps its own facing")
+            op.cam_name, op.on = cam.name, not turns
+        eyes = eyes_target(cam)
+        op = col.operator_menu_enum("bbst.cam_eyes", "target", icon='HIDE_OFF',
+                                    text=f"Eyes of: {eyes.name}" if eyes is not None else "Eyes of: nobody")
+        op.cam_name = cam.name
+        if eyes is not None and eyes_aims(cam):
+            # the old rig, where the eyes carried the aim too: its gaze sliders stay until it is freed
+            helper = eyes_helper(cam)
+            sub = col.column(align=True)
+            sub.prop(helper, "bbst_gaze_up")
+            sub.prop(helper, "bbst_gaze_turn")
+            op = sub.operator("bbst.cam_free_aim", icon='UNLOCKED')
+            op.cam_name = cam.name
+        if eyes is not None:
+            uid, _secs = step_off(cam)
+            k = beat_index_of(scene.bb_st, uid) if uid else None
+            b = scene.bb_st.beats[k] if k is not None else None
+            sub = col.column(align=True)
+            op = sub.operator_menu_enum(
+                "bbst.cam_step_off", "beat", icon='CON_TRACKTO',
+                text="Steps off at: " + (f"B{k + 1}" + (f" {b.label}" if b.label else "") if b is not None else "never"))
+            op.cam_name = cam.name
+            if b is not None:
+                sub.prop(cam, "bbst_step_s")
+        zoom = lens_fcurve(cam) is not None
+        sub = col.row(align=True)
+        sub.enabled = len(scene.bb_st.beats) > 0
+        op = sub.operator("bbst.lens_key", depress=zoom, icon='ZOOM_ALL',
+                          text="Zoom: lens set per beat" if zoom else "Zoom: one lens (click to set it per beat)")
+        op.cam_name, op.on = cam.name, not zoom
+        moves = cam_moves(cam)
+        op = col.operator("bbst.cam_moves", icon='DECORATE_KEYFRAME' if moves else 'DECORATE_ANIMATE',
+                          text="On the beats (keyed where it moves)" if moves else "Static: left out of the beats")
+        op.cam_name, op.on = cam.name, not moves
     if stage_cams(scene):
         sub = lay.row()
         sub.enabled = False
-        sub.label(text="Key lit: moves on beats · dim: static", icon='INFO')
+        sub.label(text="Camera icon lit: on screen now · every camera is keyed unless set Static", icon='INFO')
         sub = lay.row()
         sub.enabled = False
         sub.label(text="Cuts: preview pane header or the timeline", icon='MARKER_HLT')
@@ -5989,6 +7731,15 @@ def draw_settings(lay, context):
     if not any(sc.bb_st.stageable for sc in set_scenes(offered=False)):
         col.label(text="None ticked: every scene is offered", icon='INFO')
     lay.prop(st, "beat_spacing")
+    col = lay.column(align=True)
+    col.label(text="Movement:")
+    col.prop(st, "natural")
+    sub = col.column(align=True)
+    sub.enabled = st.natural
+    sub.prop(st, "pace")
+    col.prop(st, "alive", slider=True)
+    col.prop(st, "carry_set")
+    col.prop(st, "path_focus")
     lay.prop(st, "black_outside")
     if fs is not None:
         lay.prop(fs, "artist_handles")
@@ -6137,7 +7888,7 @@ def _retire_stale_copies():
         if not (t.name.startswith("bb_stage") and t.use_module):
             continue
         m = re.search(r'"version":\s*\((\d+),\s*(\d+),\s*(\d+)\)', t.as_string())
-        if m and tuple(int(g) for g in m.groups()) < tuple(bl_info["version"]):
+        if m and tuple(int(g) for g in m.groups()) < VERSION:
             t.use_module = False       # never runs again, and saves no longer carry it as a script
             stale = True
     live = getattr(getattr(getattr(bpy.types, "BBST_OT_enter_stage", None), "execute", None), "__code__", None)
@@ -6178,7 +7929,7 @@ def _bbst_after_load():
     try:
         if _retire_stale_copies() and _REREG["n"] < 2:
             _REREG["n"] += 1
-            print("BB Stage: an older embedded copy took over on load; registering", bl_info["version"])
+            print("BB Stage: an older embedded copy took over on load; registering", VERSION)
             _reclaim()          # takes the classes back; register() schedules this again
             return None
         for s in stagings():
@@ -6283,6 +8034,11 @@ def _draw_cam_labels():
         shader = gpu.shader.from_builtin('UNIFORM_COLOR')
         gpu.state.blend_set('ALPHA')
         amber = (1.0, 0.72, 0.15, 1.0)
+        # a staging cut into shots holds a camera per shot: name only the one on screen now, the ones the panes
+        # show and the selected ones, the rest keep their dot and arrow (forty name tags on one spot hide the plan)
+        many = len(cams) > CAM_LIST_FROM
+        named = {scene.camera.name if scene.camera is not None else ""} | set(shown)
+        named |= {o.name for o in cams if o.select_get()}
         for cam in cams:
             if cam.hide_get() or cam.hide_viewport:
                 continue
@@ -6305,9 +8061,13 @@ def _draw_cam_labels():
                 arrow = [(tip.x, tip.y), (base.x + n.x * 6 * ui, base.y + n.y * 6 * ui),
                          (base.x - n.x * 6 * ui, base.y - n.y * 6 * ui)]
                 batch_for_shader(shader, 'TRIS', {"pos": arrow}).draw(shader)
+            if many and cam.name not in named:
+                continue
             text = cam.name + (f"  · {' + '.join(shown[cam.name])}" if cam.name in shown else "")
             if cam.get(CAM_KEY):
                 text += "  · moves"
+            if ride_target(cam) is not None:
+                text += f"  · with {ride_target(cam).name}"
             w, h = blf.dimensions(font, text)
             x, y = p.x + 9 * ui, p.y + 7 * ui
             pad = 4 * ui
@@ -6325,20 +8085,134 @@ def _draw_cam_labels():
             print("BB Stage camera labels:", e)
 
 
+_DRAW_HANDLES = []      # kept here as well: bpy.app.driver_namespace is emptied by every file load
+
+
 def _add_cam_labels():
     _remove_cam_labels()
-    h = bpy.types.SpaceView3D.draw_handler_add(_draw_cam_labels, (), 'WINDOW', 'POST_PIXEL')
-    bpy.app.driver_namespace[_CAM_DRAW_KEY] = h
+    ns = bpy.app.driver_namespace
+    ns[_CAM_DRAW_KEY] = bpy.types.SpaceView3D.draw_handler_add(_draw_cam_labels, (), 'WINDOW', 'POST_PIXEL')
+    ns[_CAPTION_DRAW_KEY] = bpy.types.SpaceView3D.draw_handler_add(_draw_captions, (), 'WINDOW', 'POST_PIXEL')
+    _DRAW_HANDLES[:] = [ns[_CAM_DRAW_KEY], ns[_CAPTION_DRAW_KEY]]
 
 
 def _remove_cam_labels():
-    h = bpy.app.driver_namespace.get(_CAM_DRAW_KEY)
-    if h is not None:
+    handles = list(_DRAW_HANDLES)
+    for key in (_CAM_DRAW_KEY, _CAPTION_DRAW_KEY):
+        h = bpy.app.driver_namespace.get(key)
+        if h is not None and not any(h is x for x in handles):
+            handles.append(h)
+        bpy.app.driver_namespace[key] = None
+    for h in handles:
         try:
             bpy.types.SpaceView3D.draw_handler_remove(h, 'WINDOW')
         except (ValueError, RuntimeError):
             pass
-        bpy.app.driver_namespace[_CAM_DRAW_KEY] = None
+    _DRAW_HANDLES.clear()
+
+
+# ------------------------------------------------------------------ captions in the preview pane
+#
+# Aman, 11 Oct 2026: the preview pane says what the shot is about, like a subtitle, so a long edit reads
+# without the panel. The text is the beat's label and note. Drawn on screen only: playblasts stay clean.
+
+_CAPTION_DRAW_KEY = "bbst_captions"
+
+
+def caption_beat(scene, frame=None):
+    """The beat a frame belongs to: the one being moved into or held (a move belongs to the beat it ends on)."""
+    st = scene.bb_st
+    n = len(st.beats)
+    if not n:
+        return None
+    f = scene.frame_current if frame is None else frame
+    for i, b in enumerate(st.beats):
+        if f <= beat_out(b) + 0.5:
+            return i
+    return n - 1
+
+
+def _wrap_text(font, text, width, max_lines=6):
+    import blf
+    lines, cur = [], ""
+    for word in text.split():
+        trial = (cur + " " + word).strip()
+        if cur and blf.dimensions(font, trial)[0] > width:
+            lines.append(cur)
+            cur = word
+        else:
+            cur = trial
+    if cur:
+        lines.append(cur)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = lines[-1].rstrip(" .,;") + " …"
+    return lines
+
+
+def _draw_captions():
+    ctx = bpy.context
+    try:
+        win, area, region, rv3d = ctx.window, ctx.area, ctx.region, ctx.region_data
+        if win is None or area is None or region is None or rv3d is None or not _in_stage(ctx):
+            return
+        if stage_panes(win).get("CAM0") != area:
+            return
+        scene = ctx.scene
+        st = scene.bb_st
+        if not st.show_captions:
+            return
+        i = caption_beat(scene)
+        if i is None:
+            return
+        b = st.beats[i]
+        title = f"B{i + 1}  {b.label}".strip()
+        note = " ".join(b.note.split())
+        import blf
+        import gpu
+        from gpu_extras.batch import batch_for_shader
+        from bpy_extras.view3d_utils import location_3d_to_region_2d
+        # the camera frame inside the pane: the caption sits on its bottom edge, like a subtitle
+        x0, x1, y0 = 0.0, float(region.width), 0.0
+        sp = area.spaces.active
+        cam = sp.camera if sp.use_local_camera else scene.camera
+        if rv3d.view_perspective == 'CAMERA' and cam is not None and cam.type == 'CAMERA':
+            pts = [location_3d_to_region_2d(region, rv3d, cam.matrix_world @ v) for v in cam.data.view_frame(scene=scene)]
+            if all(p is not None for p in pts):
+                x0 = max(x0, min(p.x for p in pts))
+                x1 = min(x1, max(p.x for p in pts))
+                y0 = max(y0, min(p.y for p in pts))
+        if x1 - x0 < 120:
+            return
+        ui = ctx.preferences.view.ui_scale * ctx.preferences.system.pixel_size
+        font = 0
+        pad = 10 * ui
+        t_size, n_size = 14 * ui, 13 * ui
+        blf.size(font, n_size)
+        lines = _wrap_text(font, note, (x1 - x0) - 2 * pad) if note else []
+        line_h = n_size * 1.35
+        height = pad * 0.8 + t_size * 1.25 + len(lines) * line_h + pad * 0.7
+        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        gpu.state.blend_set('ALPHA')
+        box = [(x0, y0), (x1, y0), (x1, y0 + height), (x0, y0), (x1, y0 + height), (x0, y0 + height)]
+        shader.uniform_float("color", (0.03, 0.03, 0.04, 0.66))
+        batch_for_shader(shader, 'TRIS', {"pos": box}).draw(shader)
+        y = y0 + height - pad * 0.8 - t_size
+        blf.size(font, t_size)
+        blf.color(font, 1.0, 0.72, 0.15, 1.0)
+        blf.position(font, x0 + pad, y, 0)
+        blf.draw(font, title)
+        blf.size(font, n_size)
+        blf.color(font, 0.96, 0.96, 0.96, 1.0)
+        for ln in lines:
+            y -= line_h
+            blf.position(font, x0 + pad, y, 0)
+            blf.draw(font, ln)
+        gpu.state.blend_set('NONE')
+    except Exception as e:
+        if not _SYNC.get("caption_error"):
+            _SYNC["caption_error"] = True
+            print("BB Stage captions:", e)
 
 
 # ------------------------------------------------------------------ register
@@ -6349,14 +8223,16 @@ PANEL_CLASSES = [
 ]
 
 CLASSES = [
-    BBST_Beat, BBST_Path, BBST_Props,
+    BBST_Beat, BBST_Path, BBST_Move, BBST_Props,
+    BBST_OT_move_timing, BBST_OT_cam_ride, BBST_OT_cam_eyes, BBST_OT_cam_step_off, BBST_OT_lens_key,
+    BBST_OT_cam_looks_at, BBST_OT_cam_free_aim, BBST_OT_cam_ride_turn,
     BBST_OT_new_staging, BBST_OT_staging_set, BBST_OT_goto_scene, BBST_OT_delete_staging,
     BBST_OT_add_kit,
     BBST_OT_pick_standin, BBST_OT_pick_match,
     BBST_OT_add_char, BBST_OT_add_prop, BBST_OT_obj_action, BBST_UL_objects, BBST_OT_turn,
     BBST_OT_beat_add, BBST_OT_beat_save, BBST_OT_beat_goto, BBST_OT_beat_delete,
     BBST_OT_play, BBST_OT_from_start, BBST_OT_step_beat,
-    BBST_OT_fit_range, BBST_UL_beats,
+    BBST_OT_fit_range, BBST_UL_beats, BBST_UL_cams,
     BBST_OT_cam_add, BBST_OT_cam_moves, BBST_OT_rename, BBST_OT_cam_look, BBST_OT_cam_bind,
     BBST_OT_cut_here, BBST_OT_cut_remove, BBST_OT_beat_insert, BBST_OT_reset_moves,
     BBST_OT_pane_world, BBST_OT_pane_view, BBST_OT_pane_cam, BBST_OT_pane_lens,
@@ -6417,7 +8293,8 @@ def _add_keymaps():
 
 def _stop_timers():
     ns = bpy.app.driver_namespace
-    for f in ns.get(_TIMERS_KEY, []):
+    own = [globals().get("_bbst_watchdog")]             # the one timer that lives as long as the add-on
+    for f in list(ns.get(_TIMERS_KEY, [])) + [f for f in own if f is not None]:      # the namespace is emptied by a file load
         try:
             if bpy.app.timers.is_registered(f):
                 bpy.app.timers.unregister(f)
@@ -6431,12 +8308,32 @@ def register():
         try:
             bpy.utils.register_class(cls)
         except ValueError:
-            bpy.utils.unregister_class(getattr(bpy.types, cls.__name__))
+            try:
+                bpy.utils.unregister_class(cls)
+            except Exception:
+                bpy.utils.unregister_class(getattr(bpy.types, cls.__name__))
             bpy.utils.register_class(cls)
     bpy.types.Scene.bb_st = bpy.props.PointerProperty(type=BBST_Props)
     bpy.types.Camera.bbst_lens_mm = bpy.props.IntProperty(
         name="Lens (mm)", min=8, max=300, description="Focal length in whole millimetres",
-        get=lambda s: int(round(s.lens)), set=lambda s, v: setattr(s, "lens", float(min(300, max(8, v)))))
+        get=lambda s: int(round(s.lens)), set=_lens_mm_set)
+    bpy.types.Object.bbst_step_s = bpy.props.FloatProperty(
+        name="Step-off time (s)", min=0.1, max=6.0, step=10, precision=1,
+        get=lambda s: step_off(s)[1], set=_step_s_set,
+        description="How long the camera takes to let go of the eyes once it steps off. Short is a snap "
+                    "away from him, long is a slow drift off his gaze")
+    bpy.types.Object.bbst_gaze_up = bpy.props.FloatProperty(
+        name="Gaze up/down", subtype='ANGLE', min=-math.radians(85), max=math.radians(85),
+        get=_gaze_get(0, math.pi / 2), set=_gaze_setter(0, math.pi / 2),
+        description="Where this character looks on this beat, up or down from level — Save Beat keeps it")
+    bpy.types.Object.bbst_gaze_turn = bpy.props.FloatProperty(
+        name="Gaze left/right", subtype='ANGLE', min=-math.radians(120), max=math.radians(120),
+        get=_gaze_get(2, 0.0), set=_gaze_setter(2, 0.0),
+        description="How far he turns his head from straight ahead on this beat, left or right — Save Beat keeps it")
+    bpy.types.Camera.bbst_handheld = bpy.props.FloatProperty(
+        name="Handheld", default=0.0, min=0.0, max=3.0, step=10, precision=1, update=_handheld_update,
+        description="A hand-held camera: the frame drifts slowly with a little tremor on top, the same amount "
+                    "in the picture at any lens. 0 is locked off, 1 a steady hand, 2 and up reactive")
     _take_over_headers()
     _remove_named_handlers()
     for lst_name, fn_name in _HANDLERS:
@@ -6470,6 +8367,8 @@ def unregister():
         del bpy.types.Scene.bb_st
     if hasattr(bpy.types.Camera, "bbst_lens_mm"):
         del bpy.types.Camera.bbst_lens_mm
+    if hasattr(bpy.types.Camera, "bbst_handheld"):
+        del bpy.types.Camera.bbst_handheld
 
 
 if __name__ == "__main__":
