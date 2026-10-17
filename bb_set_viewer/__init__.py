@@ -83,10 +83,12 @@ v2.16 (3 Oct 2026): both modes open in Fast, not Preview. Material Preview compi
 v2.17 (3 Oct 2026): a Play button in both modes, for mocap takes and anything else keyframed.
      Both modes hide Blender's timeline, so there was no way to start playback from inside
      them. It appears only when the scene has something animated.
-v2.25 (17 Oct 2026): the Lighting panel stands aside when the BB Lighting add-on is installed.
-     BB Lighting records the lights as you actually set them by hand - on or off, colour,
-     temperature, angle, energy - instead of switching collections, which is the better tool
-     for the job. This panel remains for files that do not have it.
+v2.26 (17 Oct 2026): the Lighting panel lists the setups saved in the BB Lighting add-on, in
+     Artist Mode and in Easy Mode, as a plain selector - one click puts the set into that
+     recorded lighting, and shift 1-9 does it from the keyboard. The two add-ons talk through
+     a single Text datablock, "BB Lighting States", so neither imports the other and neither
+     breaks when the other is missing. The collection states below remain for files that have
+     no BB Lighting setups.
 v2.24 (17 Oct 2026): lighting states can live on independent axes. Give a state collection the
      custom property bb_lgt_group ("int", "ext", ...) and one state per group is live at a
      time, so picking an interior state no longer switches the gully off. States with no
@@ -139,7 +141,7 @@ from mathutils import Euler, Matrix, Vector
 bl_info = {
     "name": "BB Set Viewer",
     "author": "Beta Builder",
-    "version": (2, 25, 0),
+    "version": (2, 26, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > BB Set",
     "description": "Game-style WASD navigation and panel-driven camera control",
@@ -3493,15 +3495,6 @@ class BBSV_PT_lighting(_BBPanel, Panel):
     bl_order = 6
     flag = "show_lighting"
 
-    @classmethod
-    def poll(cls, context):
-        # BB Lighting supersedes this: it records what you actually set by hand rather than
-        # switching collections, so when it is installed this panel stands aside instead of
-        # offering a second, weaker way to do the same job.
-        if hasattr(bpy.types.Scene, "bb_light"):
-            return False
-        return super().poll(context)
-
     def draw(self, context):
         _draw_lighting(self.layout, context.scene.bb_sv, context, artist=True)
 
@@ -3581,6 +3574,48 @@ class BBSV_PT_settings(_BBPanel, Panel):
 # ---------------------------------------------------------------------------
 # Lighting states: the rig, the switch, the faders, the bake
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Lighting setups saved by the BB Lighting add-on
+#
+# The two add-ons talk through one thing: a Text datablock of JSON that BB Lighting writes and
+# this one reads. No import, no version lock, no registration order to get right - if the text
+# block is there the setups appear here, and if BB Lighting is not installed nothing breaks.
+# ---------------------------------------------------------------------------
+LIGHT_TEXT = "BB Lighting States"
+_SETUPS = {"key": None, "names": []}
+
+
+def _setups():
+    """Names of the lighting recordings BB Lighting has saved, newest read cached.
+
+    Parsed on demand rather than every redraw: the file for one set runs to tens of kilobytes
+    and this is called from draw."""
+    txt = bpy.data.texts.get(LIGHT_TEXT)
+    if txt is None:
+        _SETUPS.update(key=None, names=[])
+        return []
+    try:
+        raw = txt.as_string()
+    except Exception:
+        return _SETUPS["names"]
+    key = (txt.name, len(raw), hash(raw[:512]))
+    if _SETUPS["key"] == key:
+        return _SETUPS["names"]
+    try:
+        data = json.loads(raw or "{}")
+        names = [s.get("name", "") for s in data.get("states", []) if s.get("name")]
+    except Exception:
+        names = []
+    _SETUPS.update(key=key, names=names)
+    return names
+
+
+def _active_setup(scene):
+    p = getattr(scene, "bb_light", None)
+    name = getattr(p, "active", "") if p is not None else ""
+    return name or scene.get("bb_sv_setup", "")
+
 
 def _light_rig(scene):
     for col in scene.collection.children_recursive:
@@ -3873,6 +3908,27 @@ def _stale_states(scene):
     return ids
 
 
+class BBSV_OT_set_setup(Operator):
+    """Put the set into this saved lighting setup"""
+
+    bl_idname = "bb_sv.set_setup"
+    bl_label = "Lighting Setup"
+    bl_options = {"REGISTER", "UNDO"}
+
+    name: StringProperty()
+
+    def execute(self, context):
+        apply_op = getattr(bpy.ops.bb_light, "apply", None)
+        if apply_op is None or not apply_op.poll():
+            self.report({"ERROR"},
+                        "The BB Lighting add-on is not available to apply %r" % self.name)
+            return {"CANCELLED"}
+        apply_op(name=self.name)
+        context.scene["bb_sv_setup"] = self.name
+        _flash(self.name)
+        return {"FINISHED"}
+
+
 class BBSV_OT_set_light_state(Operator):
     """Switch the set to this lighting state"""
 
@@ -3918,6 +3974,11 @@ class BBSV_OT_light_state_hotkey(Operator):
         return _ARTIST["on"]
 
     def execute(self, context):
+        setups = _setups()
+        if setups:
+            if self.index >= len(setups):
+                return {"CANCELLED"}
+            return bpy.ops.bb_sv.set_setup(name=setups[self.index])
         states = _light_states(context.scene)
         if self.index >= len(states):
             return {"CANCELLED"}
@@ -4123,6 +4184,37 @@ class BBSV_OT_engine_preset(Operator):
 def _draw_lighting(lay, p, context, artist=True):
     """The lighting desk. If an artist has to open the Outliner to change the light, this failed."""
     scene = context.scene
+
+    # BB Lighting's saved setups win when they exist: they record what was actually set by
+    # hand, which is strictly more than the collection states below can express.
+    setups = _setups()
+    if setups:
+        live = _active_setup(scene)
+        grid = lay.grid_flow(row_major=True, columns=2 if len(setups) > 3 else 1,
+                             even_columns=True, align=True)
+        grid.scale_y = 1.4
+        for name in setups:
+            op = grid.operator("bb_sv.set_setup", text=name, depress=live == name,
+                               icon="LIGHT_DATA")
+            op.name = name
+        if artist:
+            note = lay.column(align=True)
+            note.scale_y = 0.7
+            note.label(text="Saved in BB Lighting. Adjust the lights there", icon="INFO")
+            note.label(text="and press Update to change one of these.")
+            lay.separator()
+            lay.label(text="Engine", icon="SCENE")
+            row = lay.row(align=True)
+            for engine in ("BLENDER_EEVEE", "CYCLES"):
+                sub = row.row(align=True)
+                sub.enabled = engine in _ENGINES["ok"]
+                op = sub.operator("bb_sv.set_engine",
+                                  text="EEVEE" if engine == "BLENDER_EEVEE" else "Cycles",
+                                  depress=scene.render.engine == engine)
+                op.engine = engine
+            row.operator("bb_sv.engine_preset", text="", icon="PRESET")
+        return
+
     states = _light_states(scene)
     if not states:
         box = lay.box()
@@ -4232,6 +4324,7 @@ CLASSES = (
     BBSV_OT_easy_capture,
     BBSV_OT_easy_depth,
     BBSV_OT_easy_depth_multiply,
+    BBSV_OT_set_setup,
     BBSV_OT_set_light_state,
     BBSV_OT_light_state_hotkey,
     BBSV_OT_tod_nudge,
