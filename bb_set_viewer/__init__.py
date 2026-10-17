@@ -83,6 +83,10 @@ v2.16 (3 Oct 2026): both modes open in Fast, not Preview. Material Preview compi
 v2.17 (3 Oct 2026): a Play button in both modes, for mocap takes and anything else keyframed.
      Both modes hide Blender's timeline, so there was no way to start playback from inside
      them. It appears only when the scene has something animated.
+v2.24 (17 Oct 2026): lighting states can live on independent axes. Give a state collection the
+     custom property bb_lgt_group ("int", "ext", ...) and one state per group is live at a
+     time, so picking an interior state no longer switches the gully off. States with no
+     group keep the old one-at-a-time behaviour.
 v2.23 (17 Oct 2026): Lighting. A set can hold several complete lighting setups - day with the
      sheet on, day with it off, night, the hoarding through the roof - as collections under
      "00 Lighting Rig" named "LGT · <state>", each with its own "PRB · <state>" probe holding
@@ -131,7 +135,7 @@ from mathutils import Euler, Matrix, Vector
 bl_info = {
     "name": "BB Set Viewer",
     "author": "Beta Builder",
-    "version": (2, 23, 0),
+    "version": (2, 24, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > BB Set",
     "description": "Game-style WASD navigation and panel-driven camera control",
@@ -282,6 +286,8 @@ TOD_KEY = "bb_tod"                    # scene property, 0-24, what the drivers r
 ROLE_KEY = "bb_lgt_role"              # per light: KEY / FILL / PRACTICAL / AMBIENT / OTHER
 GAIN_KEY = "bb_lgt_gain"              # per light: the fader value, read by the driver
 BASE_KEY = "bb_lgt_base_energy"       # per light: the authored energy, never overwritten
+GROUP_KEY = "bb_lgt_group"            # per state collection: "int", "ext", ... blank = one group
+ACTIVE_KEY = "bb_lgt_active"          # per scene: JSON, which state is live in each group
 STAMP_KEY = "bb_bake_stamp"           # per state collection: what the bake was made from
 OFFSET_KEY = "bb_tod_offset"          # per state collection: hours added before the drivers run
 FROZEN_KEY = "bb_state_frozen"        # per state collection: drivers muted, hand cheats kept
@@ -3612,12 +3618,65 @@ def _hide_layer_everywhere(name, hide):
                 lc.hide_viewport = hide
 
 
+def _state_group(col):
+    """Which axis this state belongs to. Interior and exterior are independent: picking an
+    interior state must not switch the gully off. A state with no group shares the single
+    unnamed group, which behaves exactly as one-at-a-time."""
+    return str(col.get(GROUP_KEY, "") or "")
+
+
+def _state_groups(scene):
+    """[(group, [(state_id, collection), ...]), ...], the unnamed group first."""
+    buckets = {}
+    for sid, col in _light_states(scene):
+        buckets.setdefault(_state_group(col), []).append((sid, col))
+    return sorted(buckets.items(), key=lambda kv: (kv[0] != "", kv[0]))
+
+
+def _active_states(scene):
+    """{group: state_id} for the states that are live right now."""
+    import json
+    try:
+        data = json.loads(scene.get(ACTIVE_KEY, "") or "{}")
+    except Exception:
+        data = {}
+    out = {}
+    for group, states in _state_groups(scene):
+        ids = [s for s, _c in states]
+        chosen = data.get(group)
+        if chosen not in ids:
+            # fall back to whatever is actually render-visible, else the first
+            visible = [s for s, c in states if not c.hide_render]
+            chosen = visible[0] if visible else (ids[0] if ids else None)
+        if chosen:
+            out[group] = chosen
+    return out
+
+
+def _set_active(scene, group, state_id):
+    import json
+    data = _active_states(scene)
+    data[group] = state_id
+    scene[ACTIVE_KEY] = json.dumps(data)
+
+
 def _apply_light_state(scene, state_id):
-    """Exactly one LGT/PRB pair render-visible, plus _always. Data API only - Artist Mode locks
-    selection and clears the active object, so anything needing a selection is dead on arrival."""
+    """Make this state live. Only its own group is touched; other groups stay as they are.
+
+    Data API only - Artist Mode locks selection and clears the active object, so anything
+    needing a selection is dead on arrival."""
     rig = _light_rig(scene)
     if rig is None or not state_id or state_id == "NONE":
         return 0
+    target = None
+    for sid, col in _light_states(scene):
+        if sid == state_id:
+            target = _state_group(col)
+            break
+    if target is None:
+        return 0
+    _set_active(scene, target, state_id)
+    group_ids = {sid for sid, col in _light_states(scene) if _state_group(col) == target}
     seen = 0
     for col in rig.children:
         name = col.name
@@ -3631,6 +3690,8 @@ def _apply_light_state(scene, state_id):
             col.hide_render = False
             _hide_layer_everywhere(name, False)
             continue
+        if sid not in group_ids:
+            continue                      # another group's business
         on = sid == state_id
         col.hide_render = not on
         _hide_layer_everywhere(name, not on)
@@ -3640,14 +3701,24 @@ def _apply_light_state(scene, state_id):
     return seen
 
 
-def _state_light_objects(scene, state_id):
-    """Every light in this state and in _always."""
-    out = []
-    for prefix_id in (state_id, ALWAYS_STATE):
-        col = _state_col(scene, prefix_id)
+def _state_light_objects(scene, state_id=None):
+    """Every light that is actually contributing: _always, plus the live state of every group.
+
+    With interior and exterior as separate groups a render has more than one state live, so a
+    fader, a bake stamp or a level read that only looked at one of them would be wrong."""
+    ids = set(_active_states(scene).values())
+    if state_id:
+        ids.add(state_id)
+    ids.add(ALWAYS_STATE)
+    out, seen = [], set()
+    for sid in sorted(ids):
+        col = _state_col(scene, sid)
         if col is None:
             continue
-        out.extend(ob for ob in col.all_objects if ob.type == "LIGHT" and ob.data)
+        for ob in col.all_objects:
+            if ob.type == "LIGHT" and ob.data and ob.name not in seen:
+                seen.add(ob.name)
+                out.append(ob)
     return out
 
 
@@ -4048,16 +4119,25 @@ def _draw_lighting(lay, p, context, artist=True):
         box.label(text="'%snight', '%sday' and so on." % (STATE_PREFIX, STATE_PREFIX))
         return
     stale = _stale_states(scene)
-    grid = lay.grid_flow(row_major=True, columns=2, even_columns=True, align=True)
-    grid.scale_y = 1.4
-    for sid, col in states:
-        label = sid.replace("_", " ").title()
-        if sid in stale:
-            label += "  *"
-        op = grid.operator("bb_sv.set_light_state", text=label,
-                           depress=p.light_state == sid,
-                           icon="LIGHT_SUN" if col.get(STAMP_KEY) else "LIGHT")
-        op.state = sid
+    live = _active_states(scene)
+    groups = _state_groups(scene)
+    for group, members in groups:
+        if group:
+            row = lay.row()
+            row.scale_y = 0.7
+            row.label(text=group.upper(), icon="OUTLINER_COLLECTION")
+        grid = lay.grid_flow(row_major=True, columns=2, even_columns=True, align=True)
+        grid.scale_y = 1.4
+        for sid, col in members:
+            # inside a group the group name is noise: "int_night" reads as "Night" under INT
+            short = sid[len(group) + 1:] if group and sid.startswith(group + "_") else sid
+            label = short.replace("_", " ").title()
+            if sid in stale:
+                label += "  *"
+            op = grid.operator("bb_sv.set_light_state", text=label,
+                               depress=live.get(group) == sid,
+                               icon="LIGHT_SUN" if col.get(STAMP_KEY) else "LIGHT")
+            op.state = sid
     if stale:
         row = lay.row()
         row.scale_y = 0.7
