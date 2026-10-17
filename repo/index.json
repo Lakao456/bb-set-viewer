@@ -7,7 +7,7 @@
       "id": "bb_crowd",
       "name": "BB Crowd",
       "tagline": "Procedural crowds for blocking: controllers and character fields",
-      "version": "0.4.1",
+      "version": "0.5.1",
       "type": "add-on",
       "maintainer": "Lakao456",
       "license": [
@@ -19,9 +19,30 @@
         "3D View",
         "Animation"
       ],
-      "archive_url": "./bb_crowd-0.4.1.zip",
-      "archive_size": 16531,
-      "archive_hash": "sha256:17ffbb3c34f1766b08b730af20f89cc6341528ee53b21153ddedf0ce1a724f7c"
+      "archive_url": "./bb_crowd-0.5.1.zip",
+      "archive_size": 57825,
+      "archive_hash": "sha256:fc4c6797e4bbc50c9fe5bed70d94391ff47d5e794f3dcdc66457b933c66547fa"
+    },
+    {
+      "schema_version": "1.0.0",
+      "id": "bb_lighting",
+      "name": "BB Lighting",
+      "tagline": "Light a set by hand, then save and re-apply the result",
+      "version": "0.1.0",
+      "type": "add-on",
+      "maintainer": "Lakao456",
+      "license": [
+        "SPDX:GPL-2.0-or-later"
+      ],
+      "blender_version_min": "4.2.0",
+      "website": "https://github.com/Lakao456/bb-set-viewer",
+      "tags": [
+        "3D View",
+        "Lighting"
+      ],
+      "archive_url": "./bb_lighting-0.1.0.zip",
+      "archive_size": 6271,
+      "archive_hash": "sha256:2bcc270800f27a8789a5d6d11e2fcc4bfe58987d4a69055cd6f031f074ce007c"
     },
     {
       "schema_version": "1.0.0",
@@ -48,7 +69,7 @@
       "id": "bb_set_viewer",
       "name": "BB Set Viewer",
       "tagline": "Game-style walk and one-panel camera for film set previs",
-      "version": "2.24.0",
+      "version": "2.25.0",
       "type": "add-on",
       "maintainer": "Lakao456",
       "license": [
@@ -63,9 +84,9 @@
         "3D View",
         "Camera"
       ],
-      "archive_url": "./bb_set_viewer-2.24.0.zip",
-      "archive_size": 48063,
-      "archive_hash": "sha256:3db81d8d57148300294e14d7ec94695439d15dc9fa474e420311c76c309e90b5"
+      "archive_url": "./bb_set_viewer-2.25.0.zip",
+      "archive_size": 48292,
+      "archive_hash": "sha256:2b9a0c278a49efd8e907042771abca59eb59d11554b06a9d2e76673a9ffa1b3f"
     },
     {
       "schema_version": "1.0.0",
@@ -95,7 +116,7 @@
       "id": "bb_stage",
       "name": "BB Stage",
       "tagline": "Staging and blocking previs: studio, beats and cameras",
-      "version": "0.18.0",
+      "version": "0.19.1",
       "type": "add-on",
       "maintainer": "Lakao456",
       "license": [
@@ -111,9 +132,9 @@
         "Animation",
         "Camera"
       ],
-      "archive_url": "./bb_stage-0.18.0.zip",
-      "archive_size": 91604,
-      "archive_hash": "sha256:385b9dcbf1de7c844ae3cea7ef339ee04b70eb9bad9f73be771157baf7ed2ba6"
+      "archive_url": "./bb_stage-0.19.1.zip",
+      "archive_size": 217032,
+      "archive_hash": "sha256:c6ead049e96f11826d4ac893f27da908c5ea90cdbfa83518e900783d03db371a"
     }
   ]
 }

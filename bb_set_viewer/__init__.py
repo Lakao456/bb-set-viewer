@@ -83,6 +83,10 @@ v2.16 (3 Oct 2026): both modes open in Fast, not Preview. Material Preview compi
 v2.17 (3 Oct 2026): a Play button in both modes, for mocap takes and anything else keyframed.
      Both modes hide Blender's timeline, so there was no way to start playback from inside
      them. It appears only when the scene has something animated.
+v2.25 (17 Oct 2026): the Lighting panel stands aside when the BB Lighting add-on is installed.
+     BB Lighting records the lights as you actually set them by hand - on or off, colour,
+     temperature, angle, energy - instead of switching collections, which is the better tool
+     for the job. This panel remains for files that do not have it.
 v2.24 (17 Oct 2026): lighting states can live on independent axes. Give a state collection the
      custom property bb_lgt_group ("int", "ext", ...) and one state per group is live at a
      time, so picking an interior state no longer switches the gully off. States with no
@@ -135,7 +139,7 @@ from mathutils import Euler, Matrix, Vector
 bl_info = {
     "name": "BB Set Viewer",
     "author": "Beta Builder",
-    "version": (2, 24, 0),
+    "version": (2, 25, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > BB Set",
     "description": "Game-style WASD navigation and panel-driven camera control",
@@ -3488,6 +3492,15 @@ class BBSV_PT_lighting(_BBPanel, Panel):
     bl_idname = "BBSV_PT_lighting"
     bl_order = 6
     flag = "show_lighting"
+
+    @classmethod
+    def poll(cls, context):
+        # BB Lighting supersedes this: it records what you actually set by hand rather than
+        # switching collections, so when it is installed this panel stands aside instead of
+        # offering a second, weaker way to do the same job.
+        if hasattr(bpy.types.Scene, "bb_light"):
+            return False
+        return super().poll(context)
 
     def draw(self, context):
         _draw_lighting(self.layout, context.scene.bb_sv, context, artist=True)

@@ -1,0 +1,12 @@
+schema_version = "1.0.0"
+
+id = "bb_lighting"
+version = "0.1.0"
+name = "BB Lighting"
+tagline = "Light a set by hand, then save and re-apply the result"
+maintainer = "Lakao456"
+type = "add-on"
+website = "https://github.com/Lakao456/bb-set-viewer"
+tags = ["3D View", "Lighting"]
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-2.0-or-later"]
