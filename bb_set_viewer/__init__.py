@@ -141,7 +141,7 @@ from mathutils import Euler, Matrix, Vector
 bl_info = {
     "name": "BB Set Viewer",
     "author": "Beta Builder",
-    "version": (2, 26, 0),
+    "version": (2, 26, 1),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > BB Set",
     "description": "Game-style WASD navigation and panel-driven camera control",
@@ -3918,12 +3918,17 @@ class BBSV_OT_set_setup(Operator):
     name: StringProperty()
 
     def execute(self, context):
-        apply_op = getattr(bpy.ops.bb_light, "apply", None)
-        if apply_op is None or not apply_op.poll():
+        # bpy.ops is a dynamic namespace: hasattr and getattr succeed for operators that do not
+        # exist, and the error only surfaces when you call it. Registration is the honest test.
+        if not hasattr(bpy.types.Scene, "bb_light"):
             self.report({"ERROR"},
-                        "The BB Lighting add-on is not available to apply %r" % self.name)
+                        "BB Lighting is not installed, so %r cannot be applied" % self.name)
             return {"CANCELLED"}
-        apply_op(name=self.name)
+        try:
+            bpy.ops.bb_light.apply(name=self.name)
+        except Exception as exc:
+            self.report({"ERROR"}, "Could not apply %r: %s" % (self.name, exc))
+            return {"CANCELLED"}
         context.scene["bb_sv_setup"] = self.name
         _flash(self.name)
         return {"FINISHED"}
