@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "bb_lighting"
-version = "0.1.0"
+version = "0.2.0"
 name = "BB Lighting"
 tagline = "Light a set by hand, then save and re-apply the result"
 maintainer = "Lakao456"

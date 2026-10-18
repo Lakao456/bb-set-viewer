@@ -18,6 +18,11 @@ right for framing a shot and useless for lighting one.
 Where it is kept: a Text datablock called "BB Lighting States", as readable JSON. It travels
 with the .blend, it can be read and edited by hand in the Text Editor, and it can be diffed.
 
+v0.2 (18 Oct 2026): a state records WHICH world the scene is on, not just the dials inside it,
+     so a day HDRI and a night HDRI are two states and applying one switches scene.world. A
+     recorded world that is missing from the file is reported instead of silently leaving the
+     wrong sky up. Also: the state rows no longer overlap in a narrow sidebar - the three
+     action buttons sat at scale_x 0.6, under their own icon width.
 v0.1 (17 Oct 2026): first version - record, apply, update, rename, delete; Lighting Mode.
 """
 
@@ -31,7 +36,7 @@ from bpy.types import Operator, Panel, PropertyGroup
 bl_info = {
     "name": "BB Lighting",
     "author": "Beta Builder",
-    "version": (0, 1, 0),
+    "version": (0, 2, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > BB Light",
     "description": "Light a set by hand and save the result as a named, re-applicable state",
@@ -122,49 +127,87 @@ def _lights(scene):
                   key=lambda o: o.name)
 
 
+# World node values worth recording, by node type. A day and a night look are usually two
+# different world datablocks - a daylight HDRI and a night one - so the state records WHICH
+# world as well as the dials inside it, and applying a state switches scene.world.
+WORLD_NODE_PROPS = {
+    "TEX_SKY": ("sun_elevation", "sun_rotation", "sun_intensity", "sun_size",
+                "altitude", "air_density", "dust_density", "ozone_density"),
+}
+WORLD_NODE_INPUTS = ("Color", "Strength", "Location", "Rotation", "Scale")
+
+
 def _world_snapshot(scene):
-    """Background colour and strength, and the sun angle if the world uses a Sky texture."""
+    """Which world the scene is on, and the dials inside it."""
     out = {}
     world = scene.world
-    if world is None or not world.node_tree:
+    if world is None:
         return out
     out["world"] = world.name
+    if not world.node_tree:
+        return out
+    nodes = {}
     for node in world.node_tree.nodes:
-        if node.type == "BACKGROUND":
-            col = node.inputs.get("Color")
-            st = node.inputs.get("Strength")
-            if col is not None and hasattr(col, "default_value") and len(col.default_value) >= 3:
-                out["bg_color"] = [float(col.default_value[i]) for i in range(3)]
-            if st is not None:
-                out["bg_strength"] = float(st.default_value)
-        elif node.type == "TEX_SKY":
-            for attr in ("sun_elevation", "sun_rotation", "sun_intensity", "sun_size",
-                         "altitude", "air_density", "dust_density", "ozone_density"):
-                if hasattr(node, attr):
-                    out["sky_" + attr] = float(getattr(node, attr))
+        rec = {}
+        for name in WORLD_NODE_INPUTS:
+            inp = node.inputs.get(name)
+            val = getattr(inp, "default_value", None) if inp is not None else None
+            if val is None:
+                continue
+            if hasattr(val, "__len__"):
+                rec["in." + name] = [float(v) for v in val]
+            else:
+                rec["in." + name] = float(val)
+        for attr in WORLD_NODE_PROPS.get(node.type, ()):
+            if hasattr(node, attr):
+                rec[attr] = float(getattr(node, attr))
+        if rec:
+            nodes[node.name] = rec
+    if nodes:
+        out["world_nodes"] = nodes
     return out
 
 
 def _world_restore(scene, snap):
+    """Put the scene back on the recorded world, then restore its dials.
+
+    A missing world is reported rather than guessed at: a state recorded in a file that had the
+    night HDRI, applied in one that does not, must not silently leave the day sky up and look
+    like it worked."""
+    if not snap:
+        return None
+    name = snap.get("world")
+    if name:
+        world = bpy.data.worlds.get(name)
+        if world is None:
+            return "world %r is not in this file" % name
+        if scene.world is not world:
+            scene.world = world
     world = scene.world
-    if world is None or not world.node_tree or not snap:
-        return
+    nodes = snap.get("world_nodes") or {}
+    if world is None or not world.node_tree or not nodes:
+        return None
     for node in world.node_tree.nodes:
-        if node.type == "BACKGROUND":
-            col = node.inputs.get("Color")
-            st = node.inputs.get("Strength")
-            if col is not None and "bg_color" in snap and hasattr(col, "default_value"):
-                for i in range(3):
-                    col.default_value[i] = snap["bg_color"][i]
-            if st is not None and "bg_strength" in snap:
-                st.default_value = snap["bg_strength"]
-        elif node.type == "TEX_SKY":
-            for key, val in snap.items():
-                if key.startswith("sky_") and hasattr(node, key[4:]):
-                    try:
-                        setattr(node, key[4:], val)
-                    except Exception:
-                        pass
+        rec = nodes.get(node.name)
+        if not rec:
+            continue
+        for key, val in rec.items():
+            try:
+                if key.startswith("in."):
+                    inp = node.inputs.get(key[3:])
+                    if inp is None or not hasattr(inp, "default_value"):
+                        continue
+                    cur = inp.default_value
+                    if hasattr(cur, "__len__"):
+                        for i in range(min(len(cur), len(val))):
+                            cur[i] = val[i]
+                    else:
+                        inp.default_value = val
+                elif hasattr(node, key):
+                    setattr(node, key, val)
+            except Exception as exc:
+                print("BB Lighting: world %s.%s failed (%s)" % (node.name, key, exc))
+    return None
 
 
 def _capture(scene):
@@ -224,7 +267,9 @@ def _apply(scene, state):
         restored += 1
     # lights that exist now but were not in the recording are LEFT ALONE, never guessed at
     extra = sorted(set(in_scope) - set(lights))
-    _world_restore(scene, state)
+    world_problem = _world_restore(scene, state)
+    if world_problem:
+        missing.append(world_problem)
     scene.update_tag()
     vl = getattr(bpy.context, "view_layer", None)
     if vl is not None:
@@ -503,16 +548,20 @@ class BBL_PT_main(Panel):
             box.label(text="then press Save Current Lighting.")
         for state in states:
             name = state.get("name", "")
+            # A split, not scale_x. Squeezing icon buttons below their natural width makes them
+            # overlap each other and the panel edge in a narrow sidebar, which is exactly what
+            # scale_x = 0.6 did here. The split gives the name the room and the three actions a
+            # fixed share that Blender is free to draw at its own icon width.
             row = lay.row(align=True)
             row.scale_y = 1.3
-            op = row.operator("bb_light.apply", text=name,
-                              depress=p.active == name, icon="LIGHT_DATA")
+            split = row.split(factor=0.62, align=True)
+            op = split.operator("bb_light.apply", text=name,
+                                depress=p.active == name, icon="LIGHT_DATA")
             op.name = name
-            sub = row.row(align=True)
-            sub.scale_x = 0.6
-            sub.operator("bb_light.update", text="", icon="FILE_REFRESH").name = name
-            sub.operator("bb_light.rename", text="", icon="GREASEPENCIL").name = name
-            sub.operator("bb_light.delete", text="", icon="X").name = name
+            actions = split.row(align=True)
+            actions.operator("bb_light.update", text="", icon="FILE_REFRESH").name = name
+            actions.operator("bb_light.rename", text="", icon="GREASEPENCIL").name = name
+            actions.operator("bb_light.delete", text="", icon="X").name = name
 
         lay.separator()
         row = lay.row()
