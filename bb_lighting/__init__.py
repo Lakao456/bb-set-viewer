@@ -18,6 +18,10 @@ right for framing a shot and useless for lighting one.
 Where it is kept: a Text datablock called "BB Lighting States", as readable JSON. It travels
 with the .blend, it can be read and edited by hand in the Text Editor, and it can be diffed.
 
+v0.2.1 (19 Oct 2026): every world a state names gets a fake user, and keeps it. Blender drops a
+     datablock with no users on save, and a night world has no users the moment the scene is
+     on the day one - the Cloudy night sky world and its packed HDRI vanished from Jai's file
+     on the first save after Day was applied.
 v0.2 (18 Oct 2026): a state records WHICH world the scene is on, not just the dials inside it,
      so a day HDRI and a night HDRI are two states and applying one switches scene.world. A
      recorded world that is missing from the file is reported instead of silently leaving the
@@ -36,7 +40,7 @@ from bpy.types import Operator, Panel, PropertyGroup
 bl_info = {
     "name": "BB Lighting",
     "author": "Beta Builder",
-    "version": (0, 2, 0),
+    "version": (0, 2, 1),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > BB Light",
     "description": "Light a set by hand and save the result as a named, re-applicable state",
@@ -137,12 +141,30 @@ WORLD_NODE_PROPS = {
 WORLD_NODE_INPUTS = ("Color", "Strength", "Location", "Rotation", "Scale")
 
 
+def _keep_world(world):
+    """A world a state records must survive a save. Blender drops any datablock with no users
+    when the file is written, and a night world has no users the moment the scene is on the
+    day one - measured: the Cloudy night sky world and its packed HDRI vanished from Jai's file
+    on the first save after Day was applied. A fake user is what keeps it."""
+    if world is not None and not world.use_fake_user:
+        world.use_fake_user = True
+
+
+def _recorded_worlds():
+    """Every world any saved state names."""
+    try:
+        return {s.get("world") for s in _load()["states"] if s.get("world")}
+    except Exception:
+        return set()
+
+
 def _world_snapshot(scene):
     """Which world the scene is on, and the dials inside it."""
     out = {}
     world = scene.world
     if world is None:
         return out
+    _keep_world(world)
     out["world"] = world.name
     if not world.node_tree:
         return out
@@ -183,6 +205,11 @@ def _world_restore(scene, snap):
             return "world %r is not in this file" % name
         if scene.world is not world:
             scene.world = world
+        _keep_world(world)
+        # the world we just left must survive too, or the next save purges the other state
+        for other in bpy.data.worlds:
+            if other.name in _recorded_worlds():
+                _keep_world(other)
     world = scene.world
     nodes = snap.get("world_nodes") or {}
     if world is None or not world.node_tree or not nodes:
