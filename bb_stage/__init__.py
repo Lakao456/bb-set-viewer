@@ -33,6 +33,16 @@ props can't be clicked in the panes, so framing a shot never nudges them.
 staging prop) into a real prop that stands in the studio on the shoot day, listed with its size in the Studio tab and
 in the staging pack; Add Wall and Add Door Flat sit at the top of the Studio tab; a new camera is Static unless its
 Add Camera dialog ticks "Animated on the beats"; sitting down and getting up keep the feet on the floor.
+
+0.19.3 (26 Oct 2026, the Dubey staging file): the staging dropdown lists stagings whose set is linked from another
+file (ComputerDen_STG links the set from ComputerDen_INT, so it has no set scene and the menu came up empty); and
+Block › Kimodo bodies shows a staging's Kimodo bodies, its pegs, or both (the Stage to Kimodo pass), for one staging
+or every staging. Nothing moves and nothing is deleted: the bodies hang on their pegs in every mode.
+
+0.19.4 (26 Oct 2026, Aman's next notes on the Dubey staging file): Block and Camera › Lighting switches the staging
+between the set's BB Lighting states (switch only; the lights are BB Light's); a camera pane picks its camera from a
+row of buttons with short names ("Cam A · Sc 055" reads "A"; more than eight cameras fold into a dropdown); with the
+Kimodo bodies on, the plan names each body at its hips. A module can now exist only where it applies (Module.needs).
 """
 
 import json
@@ -49,7 +59,7 @@ from mathutils import Euler, Matrix, Quaternion, Vector
 bl_info = {
     "name": "BB Stage",
     "author": "Beta Builder",
-    "version": (0, 19, 1),
+    "version": (0, 19, 4),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > BB Stage",
     "category": "3D View",
@@ -6294,20 +6304,25 @@ ARTIST_TABS = {'STUDIO', 'OUTPUT'}        # Easy Mode shows Block and Camera onl
 class Module:
     """One module of the sidebar. tabs: the mode tabs it shows in; draw / in_use: names of functions in this file
     (draw(layout, context[, compact=True]) and in_use(scene) -> bool); compact: tabs where it draws its short form;
-    parent: the module whose panel it sits in (a sub-panel); always: no Switchboard tick; artist: Artist Mode only."""
+    parent: the module whose panel it sits in (a sub-panel); always: no Switchboard tick; artist: Artist Mode only;
+    needs: name of a function (scene) -> bool, the module exists only where it says so (a file with Kimodo bodies)."""
     __slots__ = ("id", "label", "tabs", "draw", "what", "icon", "always", "default", "in_use", "artist", "parent",
-                 "compact")
+                 "compact", "needs")
 
     def __init__(self, id, label, tabs, draw, what, icon='NONE', always=False, default=True, in_use="",
-                 artist=False, parent="", compact=()):
+                 artist=False, parent="", compact=(), needs=""):
         self.id, self.label, self.tabs, self.draw, self.what, self.icon = id, label, tuple(tabs), draw, what, icon
         self.always, self.default, self.in_use, self.artist = always, default, in_use, artist
-        self.parent, self.compact = parent, tuple(compact)
+        self.parent, self.compact, self.needs = parent, tuple(compact), needs
 
 
 MODULES = (
     Module("beats", "Beats", ("BLOCK", "CAMERA"), "draw_beats", "The beat list, Save Beat, play",
            icon='KEYFRAME_HLT', always=True, compact=("CAMERA",)),
+    # 0.19.4 (Aman, 26 Oct 2026: "set the location lighting in each of these scenes ... I only need to switch between
+    # the different lighting modes"): BB Lighting's states, switch only; where BB Lighting is on and has states
+    Module("lighting", "Lighting", ("BLOCK", "CAMERA"), "draw_lighting",
+           "Which lighting state of the set this staging plays in", icon='LIGHT_SUN', needs="lighting_available"),
     Module("cast", "Characters", ("BLOCK",), "draw_cast", "Who is in the scene, from the cast library",
            icon='COMMUNITY', always=True),
     Module("poses", "Poses", ("BLOCK",), "draw_poses", "Stand, sit or lie on a beat", icon='POSE_HLT',
@@ -6322,6 +6337,10 @@ MODULES = (
     Module("natural", "Natural moves", ("BLOCK",), "draw_natural",
            "People walk at their own pace and turn where they go; timing by hand", icon='IPO_EASE_IN_OUT',
            in_use="natural_in_use"),
+    # 0.19.3 (Aman, 26 Oct 2026: "an option to see it as the kimodo animation"): only where a staging has bodies
+    Module("bodies", "Kimodo bodies", ("BLOCK",), "draw_bodies",
+           "Show the staging's Kimodo bodies, its pegs, or both", icon='ARMATURE_DATA',
+           in_use="bodies_in_use", needs="bodies_in_use"),
     Module("cameras", "Cameras", ("CAMERA",), "draw_cams", "The staging's cameras and their lenses",
            icon='OUTLINER_OB_CAMERA', always=True),
     Module("cam_rigs", "Camera moves", ("CAMERA",), "draw_cam_moves",
@@ -13691,9 +13710,43 @@ _CAM_ENUM_CACHE = []   # dynamic enum strings must stay referenced
 
 def _cam_enum_items(self, context):
     global _CAM_ENUM_CACHE
-    cams = stage_cams(context.scene) if (context and is_staging(context.scene)) else []
-    _CAM_ENUM_CACHE = [(c.name, c.name, "") for c in cams] or [('NONE', "No cameras", "")]
+    scene = context.scene if context else None
+    cams = stage_cams(scene) if (scene is not None and is_staging(scene)) else []
+    _CAM_ENUM_CACHE = [(c.name, cam_short(c, scene), c.name) for c in cams] or [('NONE', "No cameras", "")]
     return _CAM_ENUM_CACHE
+
+
+CAM_SELECT_MAX = 8      # more cameras than this and the pane's camera selector folds into a dropdown
+
+
+def cam_short(cam, scene=None):
+    """A camera's name cut short for the pane selector (Aman, 26 Oct 2026: "don't show the whole camera name in the
+    selector, abbreviate them"): the staging's own label and a leading "Cam" go, "Cam A · Sc 055" reads "A"."""
+    n = cam.name
+    lab = staging_label(scene) if scene is not None else ""
+    for sep in (" · ", " - ", " "):
+        if lab and n.endswith(sep + lab):
+            n = n[:-len(sep + lab)]
+            break
+    m = re.match(r"^(?:STG\s+)?cam(?:era)?[\s._·-]*(.+)$", n, re.I)
+    if m and m.group(1).strip():
+        n = m.group(1).strip()
+    return n if len(n) <= 7 else n[:6] + "…"
+
+
+def _cam_selector(lay, scene, current):
+    """The camera pane's selector: one button per staging camera, the one the pane looks through pressed."""
+    cams = stage_cams(scene)
+    row = lay.row(align=True)
+    if len(cams) > CAM_SELECT_MAX:
+        _dropdown(row, 5, "bbst.pane_cam_pick", "cam", cam_short(current, scene), icon='VIEW_CAMERA')
+        return
+    row.label(text="", icon='VIEW_CAMERA')
+    shorts = [cam_short(c, scene) for c in cams]
+    for c, s in zip(cams, shorts):
+        text = s if shorts.count(s) == 1 else c.name       # two cameras that shorten alike keep their names
+        op = row.operator("bbst.pane_cam_pick", text=text, depress=(c == current))
+        op.cam = c.name
 
 
 class BBST_OT_pane_cam_pick(bpy.types.Operator):
@@ -13701,6 +13754,13 @@ class BBST_OT_pane_cam_pick(bpy.types.Operator):
     bl_idname = "bbst.pane_cam_pick"
     bl_label = "Camera"
     cam: bpy.props.EnumProperty(items=_cam_enum_items)
+
+    @classmethod
+    def description(cls, context, props):
+        try:
+            return f"Look through {props.cam} in this pane"
+        except Exception:
+            return "Which camera this pane looks through"
 
     def execute(self, context):
         ob = bpy.data.objects.get(self.cam)
@@ -13777,11 +13837,11 @@ def _stage_header_draw(self, context):
                 lay.operator("bbst.cam_add", text="Add Camera", icon='ADD')
             else:
                 cut = cut_at(scene, scene.frame_current)
-                showing = scene.camera.name if scene.camera is not None else "—"
+                showing = cam_short(scene.camera, scene) if scene.camera is not None else "—"
                 lay.label(text=f"Preview · {showing}", icon='SEQUENCE')
-                _dropdown(lay, 8, "bbst.cut_here", "cam",
-                          f"Cut here: {cut.camera.name}" if (cut is not None and cut.camera) else "Add camera cut",
-                          icon='MARKER_HLT')
+                _dropdown(lay, 7, "bbst.cut_here", "cam",
+                          f"Cut here: {cam_short(cut.camera, scene)}" if (cut is not None and cut.camera)
+                          else "Add camera cut", icon='MARKER_HLT')
                 sub = lay.row(align=True)
                 sub.enabled = cut is not None
                 sub.operator("bbst.cut_remove", text="", icon='X')
@@ -13794,7 +13854,7 @@ def _stage_header_draw(self, context):
             if cam is None:      # empty state: the way to a camera, not a dead dropdown
                 lay.operator("bbst.cam_add", text="Add Camera", icon='ADD')
             else:
-                _dropdown(lay, 8, "bbst.pane_cam_pick", "cam", cam.name, icon='VIEW_CAMERA')
+                _cam_selector(lay, scene, cam)
                 row = lay.row(align=True)
                 row.operator("bbst.lens_step", text="", icon='TRIA_LEFT').forward = False
                 sub = row.row(align=True)
@@ -15639,7 +15699,20 @@ def module_shown(context, m):
         return False
     if cur_tab(context) not in m.tabs:
         return False
+    if not module_possible(context.scene, m):
+        return False
     return feature_on(context.scene, m.id) or module_in_use(context.scene, m)
+
+
+def module_possible(scene, m):
+    """A module with 'needs' exists only where its function says so (Kimodo bodies, BB Lighting states)."""
+    if not m.needs:
+        return True
+    fn = globals().get(m.needs)
+    try:
+        return bool(fn is not None and fn(scene))
+    except Exception:
+        return False
 
 
 def features_from_defaults(scene):
@@ -15707,6 +15780,108 @@ def kit_in_use(scene):
                for o in coll_objects(c)):
             return True
     return any(o.get(STANDIN_KEY) or o.get(SOURCE_KEY) for o in stage_objects(scene))
+
+
+# ---- Kimodo bodies (the Stage to Kimodo pass, 3_Toolchain/Scripts/bb_stage_kimodo): stage_bodies.py puts each body
+# in the collection "Bodies · <staging>" (tagged bb_sk = "characters", bb_sk_staging = the scene's name), its rig a
+# child of the peg. The switch is the "Bodies switch" text those files carry, made a module.
+SK_TAG, SK_STG_TAG = "bb_sk", "bb_sk_staging"
+BODY_MODES = (('BODIES', "Bodies", "The bodies, no pegs"),
+              ('BOTH', "Both", "The bodies, and the pegs as wire outlines you can still grab"),
+              ('PEGS', "Pegs", "The plain blockout: no bodies"))
+
+
+def bodies_colls(scene):
+    """This staging's body collections (tagged with the staging; a 13 Oct file: the tagged ones in its tree)."""
+    mine = [c for c in bpy.data.collections if c.get(SK_TAG) == "characters" and c.get(SK_STG_TAG) == scene.name]
+    if mine:
+        return mine
+    names = {c.name for c in scene.collection.children_recursive}
+    return [c for c in bpy.data.collections if c.get(SK_TAG) == "characters" and c.get(SK_STG_TAG) is None
+            and c.name in names]
+
+
+def body_pegs(scene):
+    """The pegs that carry a body in this staging."""
+    out = []
+    for c in bodies_colls(scene):
+        for ob in c.all_objects:
+            if ob.type == 'ARMATURE' and SK_TAG in ob and ob.parent is not None and ob.parent not in out:
+                out.append(ob.parent)
+    return out
+
+
+def bodies_in_use(scene):
+    return bool(bodies_colls(scene))
+
+
+def bodies_mode(scene):
+    return scene.get("bb_sk_show", "pegs").upper()
+
+
+def bodies_switch(scene, mode):
+    """One staging to 'BODIES', 'BOTH' or 'PEGS': the body collections' own viewport and render switches (Stage
+    Mode, which re-shows a staging's collections, leaves those alone) and the pegs' display, viewport and render
+    switches, put back exactly as they were in Pegs. Visibility: never from a frame or depsgraph handler."""
+    colls = bodies_colls(scene)
+    show = mode != 'PEGS'
+    for c in colls:
+        if c.hide_viewport != (not show):
+            c.hide_viewport = not show
+        if c.hide_render != (not show):
+            c.hide_render = not show
+    pegs = body_pegs(scene)
+    for peg in pegs:
+        if "bb_sk_display" not in peg:                  # how it was before any body: kept on the peg
+            peg["bb_sk_display"] = peg.display_type
+        if "bb_sk_render" not in peg:
+            peg["bb_sk_render"] = 0 if peg.display_type == 'WIRE' else int(peg.hide_render)
+        if "bb_sk_hide" not in peg:
+            peg["bb_sk_hide"] = 0
+        left = bool(peg.get("bb_sk_left"))              # a walker the crowd took off its peg: the peg stays hidden
+        if mode == 'PEGS':
+            peg.display_type = peg["bb_sk_display"]
+            peg.hide_render = bool(peg["bb_sk_render"])
+            peg.hide_viewport = bool(peg["bb_sk_hide"])
+        elif mode == 'BOTH':
+            peg.display_type = 'WIRE'
+            peg.hide_render = True
+            peg.hide_viewport = left
+        else:
+            peg.display_type = peg["bb_sk_display"]
+            peg.hide_render = True
+            peg.hide_viewport = True
+    scene["bb_sk_show"] = mode.lower()
+    return len(pegs)
+
+
+def body_point(peg):
+    """Where a peg's Kimodo body is on screen: its rig's root bone (the hips), else the peg."""
+    for ob in peg.children:
+        if ob.type == 'ARMATURE' and SK_TAG in ob and ob.pose is not None and len(ob.pose.bones):
+            root = next((b for b in ob.pose.bones if b.parent is None), None)
+            if root is not None:
+                return ob.matrix_world @ root.head
+    return peg.matrix_world.translation
+
+
+# ---- Lighting (BB Lighting's states, switched from here; the lights themselves are BB Light's business)
+LIGHT_TEXT = "BB Lighting States"
+
+
+def lighting_states():
+    """The names of the BB Lighting states this file has (its own, or linked from the set file)."""
+    t = bpy.data.texts.get(LIGHT_TEXT)
+    if t is None:
+        return []
+    try:
+        return [s.get("name", "") for s in json.loads(t.as_string() or "{}").get("states", []) if s.get("name")]
+    except Exception:
+        return []
+
+
+def lighting_available(scene):
+    return getattr(scene, "bb_light", None) is not None and bool(lighting_states())
 
 
 # ---- small layout helpers
@@ -15785,6 +15960,20 @@ class BBST_MT_stagings(bpy.types.Menu):
                              icon='CHECKMARK' if s == scene else 'BLANK1').scene_name = s.name
             if not mine:
                 lay.label(text="No stagings here yet", icon='BLANK1')
+        # a staging file links its set from the set file: there is no set scene here to list them under (and
+        # set_scene_of falls back to the file's first scene, itself a staging)
+        sets = set_scenes(offered=False)
+        loose = [s for s in stagings() if set_scene_of(s) not in sets]
+        if loose:
+            if not first:
+                lay.separator()
+            libs = sorted({c.library.name for s in loose for top in layer_colls(s, "SET")
+                           for c in top.children_recursive if c.library is not None})
+            lay.label(text=f"Set from {', '.join(libs)}" if libs else "Stagings",
+                      icon='LINKED' if libs else 'SCENE_DATA')
+            for s in loose:
+                lay.operator("bbst.goto_scene", text=staging_label(s),
+                             icon='CHECKMARK' if s == scene else 'BLANK1').scene_name = s.name
 
 
 class BBST_MT_staging_more(bpy.types.Menu):
@@ -15877,7 +16066,7 @@ def draw_switchboard(lay, context):
     _dim(lay, "Untick a panel to hide it. Hiding a panel switches nothing off.")
     _dim(lay, "A panel holding something this staging uses stays in view.")
     for key, label, _d, icon in TABS:
-        mods = [m for m in MODULES if m.tabs[0] == key]
+        mods = [m for m in MODULES if m.tabs[0] == key and module_possible(scene, m)]
         if not mods:
             continue
         col = lay.box().column(align=True)
@@ -16358,6 +16547,77 @@ def draw_natural(lay, context):
         _dim(lay, "A camera's timing: Camera tab, Camera moves", 'INFO')
         return
     draw_move_box(lay, context)
+
+
+def draw_lighting(lay, context):
+    """Lighting: one button per BB Lighting state; the one this staging is on is pressed. Switching only: the lights
+    are moved and saved in BB Light (in the set file, when this file links its set)."""
+    scene = context.scene
+    if not lighting_available(scene):
+        _dim(lay, "No BB Lighting states in this file or its set file", 'INFO')
+        return
+    active = scene.bb_light.active
+    col = lay.column(align=True)
+    for name in lighting_states():
+        r = col.row(align=True)
+        r.scale_y = 1.15
+        r.operator("bb_light.apply", text=name, depress=(name == active),
+                   icon='LIGHT_SUN' if name == active else 'BLANK1').name = name
+    t = bpy.data.texts.get(LIGHT_TEXT)
+    if t is not None and t.library is not None:
+        _dim(col, f"From {t.library.name}: change the lights there")
+    else:
+        _dim(col, "The lights themselves are set in BB Light")
+
+
+def draw_bodies(lay, context):
+    """Kimodo bodies: this staging's bodies, pegs or both, and the same for every staging that has bodies."""
+    scene = context.scene
+    now = bodies_mode(scene)
+    n = len(body_pegs(scene))
+    col = lay.column(align=True)
+    row = col.row(align=True)
+    row.scale_y = 1.2
+    for key, label, _d in BODY_MODES:
+        op = row.operator("bbst.bodies", text=label, depress=(now == key))
+        op.mode, op.every = key, False
+    _dim(col, f"{n} bodies on their pegs: move a peg and its body follows")
+    others = [s for s in stagings() if bodies_in_use(s)]
+    if len(others) > 1:
+        col.separator()
+        col.label(text=f"Every staging with bodies ({len(others)})")
+        row = col.row(align=True)
+        for key, label, _d in BODY_MODES:
+            op = row.operator("bbst.bodies", text=label)
+            op.mode, op.every = key, True
+
+
+class BBST_OT_bodies(bpy.types.Operator):
+    """Show this staging's Kimodo bodies, its pegs, or both"""
+    bl_idname = "bbst.bodies"
+    bl_label = "Kimodo Bodies or Pegs"
+    bl_options = {'REGISTER', 'UNDO'}
+    mode: bpy.props.EnumProperty(items=BODY_MODES, options={'SKIP_SAVE'})
+    every: bpy.props.BoolProperty(name="Every staging", default=False, options={'SKIP_SAVE'})
+
+    @classmethod
+    def description(cls, context, props):
+        what = {'BODIES': "Show the Kimodo bodies and hide the pegs",
+                'BOTH': "Show the bodies, with the pegs as wire outlines you can still grab",
+                'PEGS': "Hide the bodies and show the pegs as they were"}[props.mode]
+        return what + (" in every staging of this file" if props.every else " in this staging")
+
+    def execute(self, context):
+        scenes = [s for s in stagings() if bodies_in_use(s)] if self.every else [context.scene]
+        scenes = [s for s in scenes if bodies_in_use(s)]
+        if not scenes:
+            self.report({'WARNING'}, "This staging has no Kimodo bodies")
+            return {'CANCELLED'}
+        for s in scenes:
+            bodies_switch(s, self.mode)
+        label = dict((k, l) for k, l, _d in BODY_MODES)[self.mode]
+        self.report({'INFO'}, f"{label}: {len(scenes)} staging{'s' if len(scenes) > 1 else ''}")
+        return {'FINISHED'}
 
 
 # ---- Camera: Beats (short), Cameras, Camera moves, Cuts
@@ -17016,7 +17276,8 @@ def _draw_cam_labels():
             return
         scene = ctx.scene
         cams = stage_cams(scene)
-        if not cams:
+        bodies = body_pegs(scene) if bodies_in_use(scene) else []
+        if not cams and not bodies:
             return
         import blf
         import gpu
@@ -17081,6 +17342,26 @@ def _draw_cam_labels():
             shader.uniform_float("color", (0.06, 0.06, 0.07, 0.78))
             batch_for_shader(shader, 'TRIS', {"pos": box}).draw(shader)
             blf.color(font, *amber)
+            blf.position(font, x, y, 0)
+            blf.draw(font, text)
+        # Kimodo bodies on and the pegs hidden: the pegs' own name tags went with them, so the plan names the
+        # bodies, at the hips (Aman, 26 Oct 2026: "the character names should be visible in the top down view")
+        white = (0.96, 0.96, 0.96, 1.0)
+        for peg in bodies if bodies_mode(scene) != 'PEGS' else ():
+            if not (peg.hide_viewport or peg.hide_get()):
+                continue                # the peg is drawn (Both): Blender names it
+            p = location_3d_to_region_2d(region, rv3d, body_point(peg))
+            if p is None:
+                continue
+            text = who_label(peg, scene)
+            w, h = blf.dimensions(font, text)
+            x, y = p.x + 8 * ui, p.y + 4 * ui
+            pad = 3 * ui
+            box = [(x - pad, y - pad), (x + w + pad, y - pad), (x + w + pad, y + h + pad),
+                   (x - pad, y - pad), (x + w + pad, y + h + pad), (x - pad, y + h + pad)]
+            shader.uniform_float("color", (0.06, 0.06, 0.07, 0.72))
+            batch_for_shader(shader, 'TRIS', {"pos": box}).draw(shader)
+            blf.color(font, *white)
             blf.position(font, x, y, 0)
             blf.draw(font, text)
         gpu.state.blend_set('NONE')
@@ -17230,7 +17511,8 @@ PANEL_CLASSES = [BBST_PT_entry, BBST_PT_header] + MODULE_PANELS
 CLASSES = [
     BBST_Beat, BBST_Path, BBST_Move, BBST_Cast, BBST_SetEdit, BBST_Features, BBST_Props,
     BBST_OT_stage_tab, BBST_OT_switchboard, BBST_OT_feature_set, BBST_OT_features_default, BBST_OT_settings,
-    BBST_OT_cut_goto, BBST_MT_stagings, BBST_MT_staging_more, BBST_MT_staging_plays_in, BBST_MT_staging_delete,
+    BBST_OT_cut_goto, BBST_OT_bodies, BBST_MT_stagings, BBST_MT_staging_more, BBST_MT_staging_plays_in,
+    BBST_MT_staging_delete,
     BBST_MT_beat_more, BBST_MT_playblast,
     BBST_OT_pose, BBST_OT_char_config, BBST_OT_cast_save, BBST_OT_cast_revert, BBST_OT_cast_lock, BBST_OT_cast_link,
     BBST_OT_set_take, BBST_OT_set_reset, BBST_OT_edit_set, BBST_OT_set_repair, BBST_OT_duplicate,

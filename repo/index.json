@@ -28,7 +28,7 @@
       "id": "bb_lighting",
       "name": "BB Lighting",
       "tagline": "Light a set by hand, then save and re-apply the result",
-      "version": "0.2.1",
+      "version": "0.4.0",
       "type": "add-on",
       "maintainer": "Lakao456",
       "license": [
@@ -40,9 +40,9 @@
         "3D View",
         "Lighting"
       ],
-      "archive_url": "./bb_lighting-0.2.1.zip",
-      "archive_size": 7324,
-      "archive_hash": "sha256:42767aaa1cc80bbbfccd1f6722b7d04013c2f217f403e36c21087b1ae084c814"
+      "archive_url": "./bb_lighting-0.4.0.zip",
+      "archive_size": 15569,
+      "archive_hash": "sha256:8b182581cbd63290bc9915e1bc0800006982659a5503b37dbb2a3a0a58583b1d"
     },
     {
       "schema_version": "1.0.0",
@@ -116,7 +116,7 @@
       "id": "bb_stage",
       "name": "BB Stage",
       "tagline": "Staging and blocking previs: studio, beats and cameras",
-      "version": "0.19.1",
+      "version": "0.19.4",
       "type": "add-on",
       "maintainer": "Lakao456",
       "license": [
@@ -132,9 +132,9 @@
         "Animation",
         "Camera"
       ],
-      "archive_url": "./bb_stage-0.19.1.zip",
-      "archive_size": 217032,
-      "archive_hash": "sha256:c6ead049e96f11826d4ac893f27da908c5ea90cdbfa83518e900783d03db371a"
+      "archive_url": "./bb_stage-0.19.4.zip",
+      "archive_size": 221064,
+      "archive_hash": "sha256:f1b0b15f4ad3614e103436a37cd69d2590c7fa037cbc864f1ddfdabb411f9b86"
     }
   ]
 }
