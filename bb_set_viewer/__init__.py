@@ -83,6 +83,21 @@ v2.16 (3 Oct 2026): both modes open in Fast, not Preview. Material Preview compi
 v2.17 (3 Oct 2026): a Play button in both modes, for mocap takes and anything else keyframed.
      Both modes hide Blender's timeline, so there was no way to start playback from inside
      them. It appears only when the scene has something animated.
+v2.28 (13 Nov 2026): Render is a real render now. The Render view shows Material Preview with the
+     set's own lights on (fast to walk around in), and Capture in that view - Easy Mode and Artist
+     Mode's Render Still - starts a Cycles render of the shot: 1024 samples, denoised, GPU when
+     there is one (OptiX, then CUDA / HIP / Metal), saved as a PNG into Captures. The engine,
+     samples and output settings go back to what they were when the render ends.
+v2.27 (19 Oct 2026): a Detail panel, in every mode and in normal Blender too - Full, No details,
+     No props, Structure only - that hides the LOD tiers of a set ("<House> · 3 Details", "· 2
+     Props", "· 1 Fittings") with the eye of the active view layer only (never Exclude, never the
+     render flag), with a Gully toggle and a Jai House heavy props toggle where those exist. Show /
+     Hide Set Parts reads inside a top-level "SCENE" collection: Gully > Side A / Side B / Lane and
+     JAI HOUSE > its parts instead of one SCENE row. The collection-state lighting desk of 2.23-2.26
+     (LGT · state switching, the time of day slider and comma / full stop, the five role faders,
+     bake per state) is retired: BB Lighting 0.3 owns the lights now, those controls had no inputs
+     left, and two gain systems on one light would multiply. The BB Lighting setup buttons in
+     Artist and Easy Mode are unchanged; Easy Mode now shows them whenever setups exist.
 v2.26 (17 Oct 2026): the Lighting panel lists the setups saved in the BB Lighting add-on, in
      Artist Mode and in Easy Mode, as a plain selector - one click puts the set into that
      recorded lighting, and shift 1-9 does it from the keyboard. The two add-ons talk through
@@ -141,7 +156,7 @@ from mathutils import Euler, Matrix, Vector
 bl_info = {
     "name": "BB Set Viewer",
     "author": "Beta Builder",
-    "version": (2, 26, 1),
+    "version": (2, 28, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > BB Set",
     "description": "Game-style WASD navigation and panel-driven camera control",
@@ -273,50 +288,25 @@ def _lights_update(self, context):
 
 
 # ---------------------------------------------------------------------------
-# Lighting states (v2.23)
+# Lighting (v2.27)
 #
-# A set has several complete lighting setups - Jai's house has day with the sheet on, day with
-# it off, night, and the hoarding through the roof - and the artist switches between them. Each
-# state is a collection of lights under the rig, with its own Light Probe Volume holding its own
-# baked bounce. Exactly one state is render-visible at a time, plus the fixtures common to all.
+# BB Lighting owns the lights: its sidebar tab is the desk (sun, world, groups with gain and solo)
+# and its recordings - "setups" here - are what this add-on offers as one-click buttons. The two
+# talk through one Text datablock, so neither imports the other.
 #
-# Nothing here is a bespoke data structure: a state is a collection, a probe is a probe, the
-# time of day is a scene custom property driving ordinary drivers. An artist can add a state by
-# duplicating and renaming a collection with the add-on uninstalled.
+# The collection-state desk this add-on carried from 2.23 to 2.26 is retired: "LGT · <state>"
+# collections switched one at a time, a bb_tod time-of-day property driving drivers, five role
+# faders writing bb_lgt_gain / bb_lgt_base_energy, and a bake per state. On Jai's set it had been
+# dormant since 2.26 (the setups win), the LGT collections became BB Lighting's groups, and a second
+# gain system writing energy on the same lights as BB Lighting's group gain would multiply. Values
+# those controls saved in old files stay where they are and are ignored. Baking per recorded state
+# is a later rewrite.
 # ---------------------------------------------------------------------------
 LIGHT_RIG = "00 Lighting Rig"
-STATE_PREFIX = "LGT · "          # "LGT · day_tarp"
-PROBE_PREFIX = "PRB · "          # "PRB · day_tarp"
-ALWAYS_STATE = "_always"              # fixtures present in every state
-TOD_KEY = "bb_tod"                    # scene property, 0-24, what the drivers read
-ROLE_KEY = "bb_lgt_role"              # per light: KEY / FILL / PRACTICAL / AMBIENT / OTHER
-GAIN_KEY = "bb_lgt_gain"              # per light: the fader value, read by the driver
-BASE_KEY = "bb_lgt_base_energy"       # per light: the authored energy, never overwritten
-GROUP_KEY = "bb_lgt_group"            # per state collection: "int", "ext", ... blank = one group
-ACTIVE_KEY = "bb_lgt_active"          # per scene: JSON, which state is live in each group
-STAMP_KEY = "bb_bake_stamp"           # per state collection: what the bake was made from
-OFFSET_KEY = "bb_tod_offset"          # per state collection: hours added before the drivers run
-FROZEN_KEY = "bb_state_frozen"        # per state collection: drivers muted, hand cheats kept
-
-LIGHT_ROLES = (
-    ("KEY", "Key", "The main source"),
-    ("FILL", "Fill", "Soft fill"),
-    ("PRACTICAL", "Practicals", "Lamps, tubes and bulbs that are in shot"),
-    ("AMBIENT", "Ambient", "Sky, bounce and general lift"),
-    ("OTHER", "Other", "Anything untagged - here so no light is invisible to the desk"),
-)
 
 # Which engines this build accepts. Filled by _probe_engines() at register and on file load,
 # never from a draw callback - probing assigns to scene.render.engine and draw must not write.
 _ENGINES = {"probed": False, "ok": ["BLENDER_EEVEE"]}
-
-
-def _state_items(self, context):
-    """The state buttons, read live off the rig so a hand-made collection just appears."""
-    scene = getattr(context, "scene", None) or self.id_data
-    items = [(sid, sid.replace("_", " ").title(), "Lighting state: %s" % sid)
-             for sid, _col in _light_states(scene)]
-    return items or [("NONE", "No states", "This set has no lighting states yet")]
 
 
 # Deliberately a fixed list, not a callback over _ENGINES. An EnumProperty stores an INDEX into
@@ -328,18 +318,6 @@ ENGINE_ITEMS = (
     ("CYCLES", "Cycles", "Cycles - for judging only. It is not the same room at higher quality; "
                          "it renders emissive states differently from EEVEE"),
 )
-
-
-def _light_state_update(self, context):
-    _apply_light_state(context.scene, self.light_state)
-
-
-def _tod_update(self, context):
-    _apply_tod(context.scene, self.tod)
-
-
-def _fader_update(self, context):
-    _apply_faders(context.scene)
 
 
 def _engine_update(self, context):
@@ -413,36 +391,6 @@ class BBSV_Props(PropertyGroup):
         default=True, update=_lights_update,
     )
     show_lighting: BoolProperty(name="Lighting", default=True)
-    light_state: EnumProperty(
-        name="Lighting State",
-        description="Which complete lighting setup the set is in",
-        items=_state_items, update=_light_state_update,
-    )
-    tod: FloatProperty(
-        name="Time of Day",
-        description="Drives whatever in the rig is set up to follow it. Direct light follows "
-                    "this live; baked bounce stays where it was baked, which is why each hour "
-                    "you actually shoot becomes its own state",
-        default=12.0, min=0.0, max=24.0, precision=2, update=_tod_update,
-    )
-    tod_follow: BoolProperty(
-        name="States carry their own time",
-        description="Picking a state snaps the time of day to the hour that state was set up at",
-        default=True,
-    )
-    key_is_sun: BoolProperty(
-        name="Key is a real Sun",
-        description="Off: the key is a cheated area light at the window, which is usually what "
-                    "a film wants. On: a real Sun lamp. Both follow the same time of day",
-        default=False,
-    )
-    fader_key: FloatProperty(name="Key", default=1.0, min=0.0, max=4.0, update=_fader_update)
-    fader_fill: FloatProperty(name="Fill", default=1.0, min=0.0, max=4.0, update=_fader_update)
-    fader_practical: FloatProperty(name="Practicals", default=1.0, min=0.0, max=4.0,
-                                   update=_fader_update)
-    fader_ambient: FloatProperty(name="Ambient", default=1.0, min=0.0, max=4.0,
-                                 update=_fader_update)
-    fader_other: FloatProperty(name="Other", default=1.0, min=0.0, max=4.0, update=_fader_update)
     engine_choice: EnumProperty(
         name="Engine",
         description="EEVEE is what the states are authored and shot in. Cycles is for judging - "
@@ -1137,7 +1085,6 @@ class BBSV_OT_set_look(Operator):
         _apply_look(sh, self.mode, context.scene)
         _plain_background(sh)
         if self.mode == "RENDER":
-            _set_engine(context.scene, p.engine_choice)   # whichever engine the artist picked
             _scene_lighting(sh, True)         # a render view on the studio light is pointless
         else:
             _scene_lighting(sh, p.scene_lights)
@@ -1177,11 +1124,30 @@ def _layer_coll(lc, name):
     return None
 
 
+SCENE_ROOT = "SCENE"      # the rulebook's geometry root: its children are the parts (v2.27)
+
+
+def _is_part(col):
+    # cameras are managed in their own panel; the lighting rig is the supervisor's; "_" is
+    # quarantine and review
+    return not col.name.startswith(("_", "00 ")) and col.name != CAMERA_COLLECTION
+
+
 def _set_parts(scene):
-    """Top-level collections an artist may show or hide, with their children."""
-    # cameras are managed in their own panel; the lighting rig is the supervisor's
-    return [c for c in scene.collection.children
-            if not c.name.startswith(("_", "00 ")) and c.name != CAMERA_COLLECTION]
+    """Top-level collections an artist may show or hide, with their children.
+
+    A set organised to the rulebook keeps all its geometry under one "SCENE" collection; one
+    "SCENE" row would hide the whole set at once, so its children stand in for it - Gully (with
+    Side A / Side B / Lane under it) and JAI HOUSE (with its parts) on Jai's set."""
+    out = []
+    for c in scene.collection.children:
+        if not _is_part(c):
+            continue
+        if c.name == SCENE_ROOT:
+            out.extend(ch for ch in c.children if _is_part(ch))
+        else:
+            out.append(c)
+    return out
 
 
 class BBSV_OT_toggle_part(Operator):
@@ -1350,17 +1316,90 @@ def _watch_render():
     data or redrawing is unsafe, so they are deliberately not used here."""
     if bpy.app.is_job_running("RENDER"):
         return 0.5
-    for name, keep in list(_RENDER_KEEP.items()):
+    for name, (path, restore) in list(_RENDER_KEEP.items()):
         scene = bpy.data.scenes.get(name)
         _RENDER_KEEP.pop(name, None)
         if scene is None:
             continue
-        path, scene.render.filepath, scene.render.image_settings.file_format = keep
+        restore(scene)
         if os.path.exists(path):
             _flash("Render saved: %s" % os.path.basename(path), seconds=6)
         else:
             _flash("Render stopped - nothing saved", seconds=4)
     return None
+
+
+CYCLES_SAMPLES = 1024
+
+
+def _cycles_gpu(scene):
+    """Use the GPU when Cycles has one: OptiX first (the RTX PC), then CUDA, HIP, Metal."""
+    try:
+        prefs = bpy.context.preferences.addons["cycles"].preferences
+    except (KeyError, AttributeError):
+        return False
+    for kind in ("OPTIX", "CUDA", "HIP", "METAL", "ONEAPI"):
+        try:
+            prefs.compute_device_type = kind
+            prefs.get_devices()
+        except (TypeError, AttributeError):
+            continue
+        devs = [d for d in prefs.devices if d.type == kind]
+        if devs:
+            for d in devs:
+                d.use = True
+            scene.cycles.device = "GPU"
+            return True
+    scene.cycles.device = "CPU"
+    return False
+
+
+def _render_cycles(context, cam, path):
+    """Start a Cycles render of the shot (1024 samples, denoised) that saves itself as a PNG.
+    Everything changed here goes back when the render job ends (_watch_render)."""
+    scene = context.scene
+    r, c = scene.render, scene.cycles
+    keep = dict(engine=r.engine, filepath=r.filepath, fmt=r.image_settings.file_format,
+                camera=scene.camera)
+    if "CYCLES" not in _probe_engines(scene):
+        _flash("Cycles is not available in this Blender", seconds=5)
+        return {"CANCELLED"}
+    r.engine = "CYCLES"
+    keep.update(samples=c.samples, adaptive=c.use_adaptive_sampling, denoise=c.use_denoising,
+                device=c.device)
+    c.samples = CYCLES_SAMPLES
+    c.use_adaptive_sampling = True
+    c.use_denoising = True
+    gpu = _cycles_gpu(scene)
+    scene.camera = cam
+    r.filepath = path
+    r.image_settings.file_format = "PNG"
+
+    def restore(sc):
+        cy = sc.cycles
+        cy.samples, cy.use_adaptive_sampling, cy.use_denoising = keep["samples"], keep["adaptive"], keep["denoise"]
+        try:
+            cy.device = keep["device"]
+        except TypeError:
+            pass
+        sc.render.filepath, sc.render.image_settings.file_format = keep["filepath"], keep["fmt"]
+        try:
+            sc.render.engine = keep["engine"]
+        except TypeError:
+            pass
+        if keep["camera"] is not None:
+            sc.camera = keep["camera"]
+
+    _RENDER_KEEP[scene.name] = (path, restore)
+    _flash("Cycles render, %d samples on the %s - it saves itself when done" % (CYCLES_SAMPLES, "GPU" if gpu else "CPU"),
+           seconds=5)
+    result = bpy.ops.render.render("INVOKE_DEFAULT", write_still=True)
+    if not bpy.app.timers.is_registered(_watch_render):
+        bpy.app.timers.register(_watch_render, first_interval=1.0)
+    if "CANCELLED" in result:
+        _RENDER_KEEP.pop(scene.name, None)
+        restore(scene)
+    return result
 
 
 def _is_blank(path):
@@ -1418,7 +1457,7 @@ VIEW_LOOKS = (
                          "cavity. This is the pass the generation artists use most"),
     ("COLOUR", "Flat Colour", "Flat material colours with black outlines and no shading at all"),
     ("PREVIEW", "Preview", "Material preview: the set with its own materials"),
-    ("RENDER", "Render", "EEVEE with ray tracing, the set's own lights and world"),
+    ("RENDER", "Render", "Material preview with the set's own lights; Capture renders it in Cycles"),
 )
 LOOK_LABEL = {k: l for k, l, _t in VIEW_LOOKS}
 
@@ -1432,7 +1471,7 @@ def _apply_look(shading, key, scene=None):
         sh.type = "MATERIAL"
         return
     if key == "RENDER":
-        sh.type = "RENDERED"
+        sh.type = "MATERIAL"          # the view stays fast; Capture does the real (Cycles) render
         return
 
     sh.type = "SOLID"
@@ -2048,7 +2087,7 @@ class BBSV_OT_capture(Operator):
 
     kind: EnumProperty(items=[
         ("QUICK", "Quick Capture", "Instant grab of the view as you see it - no rendering"),
-        ("RENDER", "Render Still", "Final quality with the set's lighting - slower"),
+        ("RENDER", "Render Still", "Cycles render with the set's lighting, 1024 samples - slower"),
     ])
 
     def execute(self, context):
@@ -2075,18 +2114,8 @@ class BBSV_OT_capture(Operator):
                    if len(written) > 1 else "Captured: %s" % written[0], seconds=5)
             self.report({"INFO"}, "Captured %s" % ", ".join(written))
             return {"FINISHED"}
-        _force_eevee(scene)          # no Cycles in this workflow
-        r = scene.render
-        keep = (r.filepath, r.image_settings.file_format)
-        r.filepath = path
-        r.image_settings.file_format = "PNG"
-        # full render opens Blender's render window and saves when it finishes
-        _RENDER_KEEP[scene.name] = (path,) + keep
-        _flash("Rendering... it saves itself when done", seconds=4)
-        result = bpy.ops.render.render("INVOKE_DEFAULT", write_still=True)
-        if not bpy.app.timers.is_registered(_watch_render):
-            bpy.app.timers.register(_watch_render, first_interval=1.0)
-        return result
+        # full Cycles render: opens Blender's render window and saves when it finishes
+        return _render_cycles(context, cam, path)
 
 
 class BBSV_OT_open_captures(Operator):
@@ -2657,7 +2686,7 @@ class BBSV_OT_lens_hotkey(Operator):
         return {"FINISHED"}
 
 
-# shift 1-9 and shift numpad 1-9 pick a lighting state. Plain 1-6 already belong to the lens
+# shift 1-9 and shift numpad 1-9 pick a BB Lighting setup. Plain 1-6 already belong to the lens
 # presets, which is why these are on shift.
 STATE_KEYS = {}
 for _i, _name in enumerate(("ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "SEVEN", "EIGHT",
@@ -2699,9 +2728,7 @@ def _allowed_key(event):
     if t in LENS_BY_KEY and plain:
         return True                                  # 1-6 lens presets
     if t in STATE_KEYS and event.shift and not (cmd or event.alt):
-        return True                                  # shift 1-9 lighting states
-    if t in {"COMMA", "PERIOD"} and plain:
-        return True                                  # time of day, half an hour at a time
+        return True                                  # shift 1-9 lighting setups
     if _ARTIST.get("easy"):
         return False                                 # Easy Mode: no camera list, no locking
     return t in {"ZERO", "NUMPAD_0", "RET", "NUMPAD_ENTER"} and not (cmd or event.alt)
@@ -2736,14 +2763,10 @@ def _register_keymaps():
             k = km.keymap_items.new("bb_sv.lens_hotkey", key, "PRESS")
             k.properties.mm = mm
             _addon_keymaps.append((km, k))
-        # Plain 1-6 are taken by the lens presets, so the lighting states ride on shift.
+        # Plain 1-6 are taken by the lens presets, so the lighting setups ride on shift.
         for key, index in STATE_KEYS.items():
             k = km.keymap_items.new("bb_sv.light_state_hotkey", key, "PRESS", shift=True)
             k.properties.index = index
-            _addon_keymaps.append((km, k))
-        for key, delta in (("COMMA", -0.5), ("PERIOD", 0.5)):
-            k = km.keymap_items.new("bb_sv.tod_nudge", key, "PRESS")
-            k.properties.delta = delta
             _addon_keymaps.append((km, k))
         # then the blockers, any modifier combination
         for key in _LETTERS + _DIGITS + _FKEYS + _OTHER + _MOUSE:
@@ -2870,7 +2893,18 @@ class BBSV_OT_easy_capture(Operator):
         stamp = time.strftime("%Y-%m-%d %H%M%S")
         base = "Shot %02d - %dmm - %s" % (n, round(cam.data.lens), stamp)
         path = os.path.join(_capture_dir(), base + ".png")
-        written = _capture_all(context, area, cam, path, keys=["look"])   # what you see
+        if scene.bb_sv.look_now == "RENDER":       # the Render view: a real Cycles render
+            if bpy.app.is_job_running("RENDER"):
+                _flash("A render is already running", seconds=4)
+                return {"CANCELLED"}
+            base += " - cycles"
+            path = os.path.join(_capture_dir(), base + ".png")
+            written = [base + ".png"]
+            result = _render_cycles(context, cam, path)
+            if "CANCELLED" in result:
+                return {"CANCELLED"}
+        else:
+            written = _capture_all(context, area, cam, path, keys=["look"])   # what you see
         if not written:
             return {"CANCELLED"}
         d = cam.data
@@ -3035,7 +3069,7 @@ class BBSV_PT_easy(Panel):
         col.operator("bb_sv.easy_depth_multiply", text="Multiply with Depth Map",
                      icon="IMAGE_ZDEPTH")
 
-        if _light_states(context.scene):
+        if _setups():
             lay.separator()
             _draw_lighting(lay, p, context, artist=False)
         lay.separator()
@@ -3487,8 +3521,180 @@ class BBSV_PT_parts(_BBPanel, Panel):
                     op.name = ch.name
 
 
+# ---------------------------------------------------------------------------
+# Detail (v2.27): the LOD tiers of a set, in every mode
+#
+# A house built to the rulebook keeps its pieces in four tier collections - "<House> · 0 Structure",
+# "· 1 Fittings", "· 2 Props", "· 3 Details" - so a heavy set can be thinned in one click while
+# walking or framing. The eye of the active view layer only (LayerCollection.hide_viewport): never
+# Exclude, which resets per-object layer state and trips the 16-slot local collections cap; never
+# the collection's own monitor flag, which every view layer shares; never the render flag, so a
+# render of the shot still has everything in it.
+# ---------------------------------------------------------------------------
+TIER_SUFFIXES = (" · 1 Fittings", " · 2 Props", " · 3 Details")
+DETAIL_LEVELS = (   # key, label, tooltip, the tiers it hides
+    ("FULL", "Full", "Every tier shown", ()),
+    ("NO_DETAILS", "No details", "Hide every '· 3 Details' tier", (" · 3 Details",)),
+    ("NO_PROPS", "No props", "Hide the details and the props tiers", (" · 3 Details", " · 2 Props")),
+    ("STRUCTURE", "Structure only",
+     "Walls, slabs and roofs only - the fittings, props and details tiers hidden", TIER_SUFFIXES),
+)
+DETAIL_LABEL = {k: label for k, label, _d, _h in DETAIL_LEVELS}
+GULLY = "Gully"
+HEAVY_PROPS = "Jai House · _Heavy props"
+_DETAIL = {"key": None, "at": 0.0, "info": None}
+
+
+def _layer_colls_named(root, name):
+    """Every layer collection under root whose collection has this name."""
+    out, stack = [], [root]
+    while stack:
+        lc = stack.pop()
+        if lc.collection.name == name:
+            out.append(lc)
+        stack.extend(lc.children)
+    return out
+
+
+def _tier_layers(view_layer):
+    """{suffix: [layer collections]} for the tier collections in this view layer."""
+    out = {s: [] for s in TIER_SUFFIXES}
+    stack = [view_layer.layer_collection]
+    while stack:
+        lc = stack.pop()
+        name = lc.collection.name
+        for s in TIER_SUFFIXES:
+            if name.endswith(s):
+                out[s].append(lc)
+                break
+        stack.extend(lc.children)
+    return out
+
+
+def _detail_level(tiers):
+    """Which of the four levels the eyes describe now; "MIXED" when none does; None with no tiers."""
+    if not any(tiers.values()):
+        return None
+    for key, _label, _desc, hide in DETAIL_LEVELS:
+        if all(lc.hide_viewport == (s in hide) for s in TIER_SUFFIXES for lc in tiers[s]):
+            return key
+    return "MIXED"
+
+
+def _detail_info(context):
+    """What the Detail panel shows. Cached for half a second and dropped by its own buttons: poll
+    and draw run on every redraw, and the walk covers every collection of the set."""
+    vl = context.view_layer
+    key = (context.scene.name, vl.name, len(bpy.data.collections))
+    now = time.monotonic()
+    if _DETAIL["info"] is not None and _DETAIL["key"] == key and now - _DETAIL["at"] < 0.5:
+        return _DETAIL["info"]
+    tiers = _tier_layers(vl)
+    info = {"tiers": sum(len(v) for v in tiers.values()), "level": _detail_level(tiers)}
+    for flag, name in (("gully", GULLY), ("heavy", HEAVY_PROPS)):
+        lcs = _layer_colls_named(vl.layer_collection, name)
+        info[flag] = bool(lcs)
+        info[flag + "_hidden"] = bool(lcs) and all(lc.hide_viewport for lc in lcs)
+    info["any"] = bool(info["tiers"] or info["gully"] or info["heavy"])
+    _DETAIL.update(key=key, at=now, info=info)
+    return info
+
+
+class BBSV_OT_detail_level(Operator):
+    """Show the set at this level of detail - the eye of this view layer only; renders keep everything"""
+
+    bl_idname = "bb_sv.detail_level"
+    bl_label = "Detail Level"
+    bl_options = {"REGISTER", "UNDO"}
+
+    level: StringProperty(default="FULL")
+
+    @classmethod
+    def description(cls, context, props):
+        return next((d for k, _l, d, _h in DETAIL_LEVELS if k == props.level), cls.__doc__)
+
+    def execute(self, context):
+        hide = next((h for k, _l, _d, h in DETAIL_LEVELS if k == self.level), None)
+        if hide is None:
+            self.report({"ERROR"}, "No detail level %r" % self.level)
+            return {"CANCELLED"}
+        tiers = _tier_layers(context.view_layer)
+        if not any(tiers.values()):
+            self.report({"INFO"}, "This set has no detail tiers")
+            return {"CANCELLED"}
+        changed = 0
+        for suffix, lcs in tiers.items():
+            want = suffix in hide
+            for lc in lcs:
+                if lc.hide_viewport != want:
+                    lc.hide_viewport = want
+                    changed += 1
+        _DETAIL["info"] = None
+        _flash(DETAIL_LABEL[self.level])
+        return {"FINISHED"}
+
+
+class BBSV_OT_detail_toggle(Operator):
+    """Show or hide this part with the eye of this view layer - renders keep it"""
+
+    bl_idname = "bb_sv.detail_toggle"
+    bl_label = "Show / Hide"
+    bl_options = {"REGISTER", "UNDO"}
+
+    name: StringProperty()
+
+    def execute(self, context):
+        lcs = _layer_colls_named(context.view_layer.layer_collection, self.name)
+        if not lcs:
+            return {"CANCELLED"}
+        hide = not all(lc.hide_viewport for lc in lcs)
+        for lc in lcs:
+            lc.hide_viewport = hide
+        _DETAIL["info"] = None
+        return {"FINISHED"}
+
+
+class BBSV_PT_detail(Panel):
+    """How much of the set is drawn. In every mode - Artist, Easy and normal Blender - because a
+    heavy gully is heavy for whoever is walking it."""
+
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "BB Set"
+    bl_label = "Detail"
+    bl_idname = "BBSV_PT_detail"
+    bl_order = 5
+
+    @classmethod
+    def poll(cls, context):
+        return getattr(context, "view_layer", None) is not None and _detail_info(context)["any"]
+
+    def draw(self, context):
+        lay = self.layout
+        info = _detail_info(context)
+        if info["tiers"]:
+            level = info["level"]
+            row = lay.row()
+            row.scale_y = 0.8
+            row.label(text="Showing: %s" % DETAIL_LABEL.get(level, "a mix - pick a level"),
+                      icon="MOD_DECIM")
+            grid = lay.grid_flow(row_major=True, columns=2, even_columns=True, align=True)
+            grid.scale_y = 1.3
+            for key, label, _d, _h in DETAIL_LEVELS:
+                grid.operator("bb_sv.detail_level", text=label, depress=level == key).level = key
+        if info["gully"] or info["heavy"]:
+            col = lay.column(align=True)
+            for flag, name, label in (("gully", GULLY, "Gully"),
+                                      ("heavy", HEAVY_PROPS, "Jai House heavy props")):
+                if not info[flag]:
+                    continue
+                hidden = info[flag + "_hidden"]
+                col.operator("bb_sv.detail_toggle", text=label, depress=not hidden,
+                             icon="HIDE_ON" if hidden else "HIDE_OFF").name = name
+
+
 class BBSV_PT_lighting(_BBPanel, Panel):
-    """The lighting desk: which state the set is in, the time of day, the levels, the bake."""
+    """Which BB Lighting setup the set is in, and the engine."""
 
     bl_label = "Lighting"
     bl_idname = "BBSV_PT_lighting"
@@ -3572,10 +3778,6 @@ class BBSV_PT_settings(_BBPanel, Panel):
 
 
 # ---------------------------------------------------------------------------
-# Lighting states: the rig, the switch, the faders, the bake
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
 # Lighting setups saved by the BB Lighting add-on
 #
 # The two add-ons talk through one thing: a Text datablock of JSON that BB Lighting writes and
@@ -3617,297 +3819,6 @@ def _active_setup(scene):
     return name or scene.get("bb_sv_setup", "")
 
 
-def _light_rig(scene):
-    for col in scene.collection.children_recursive:
-        if col.name == LIGHT_RIG:
-            return col
-    return None
-
-
-def _light_states(scene):
-    """[(state_id, collection)] for every LGT collection under the rig, _always excluded."""
-    rig = _light_rig(scene)
-    if rig is None:
-        return []
-    out = []
-    for col in rig.children:
-        if not col.name.startswith(STATE_PREFIX):
-            continue
-        sid = col.name[len(STATE_PREFIX):]
-        if sid != ALWAYS_STATE:
-            out.append((sid, col))
-    out.sort(key=lambda r: r[0])
-    return out
-
-
-def _state_col(scene, state_id, prefix=STATE_PREFIX):
-    rig = _light_rig(scene)
-    if rig is None:
-        return None
-    want = prefix + state_id
-    for col in rig.children:
-        if col.name == want:
-            return col
-    return None
-
-
-def _hide_layer_everywhere(name, hide):
-    """Set hide_viewport on this collection's layer entry in every view layer that has one.
-
-    hide_viewport and Collection.hide_render do different jobs and both are needed: measured,
-    hide_viewport removes a state from the viewport but NOT from a light probe bake, while
-    hide_render removes it from the bake but not from the viewport. A state hidden only in the
-    viewport still contaminates the bake. exclude would do both but it resets per-object view
-    layer state and trips the 16-slot local collections cap, so it is not used here."""
-    for scene in bpy.data.scenes:
-        for vl in scene.view_layers:
-            lc = _layer_coll(vl.layer_collection, name)
-            if lc is not None and lc.hide_viewport != hide:
-                lc.hide_viewport = hide
-
-
-def _state_group(col):
-    """Which axis this state belongs to. Interior and exterior are independent: picking an
-    interior state must not switch the gully off. A state with no group shares the single
-    unnamed group, which behaves exactly as one-at-a-time."""
-    return str(col.get(GROUP_KEY, "") or "")
-
-
-def _state_groups(scene):
-    """[(group, [(state_id, collection), ...]), ...], the unnamed group first."""
-    buckets = {}
-    for sid, col in _light_states(scene):
-        buckets.setdefault(_state_group(col), []).append((sid, col))
-    return sorted(buckets.items(), key=lambda kv: (kv[0] != "", kv[0]))
-
-
-def _active_states(scene):
-    """{group: state_id} for the states that are live right now."""
-    import json
-    try:
-        data = json.loads(scene.get(ACTIVE_KEY, "") or "{}")
-    except Exception:
-        data = {}
-    out = {}
-    for group, states in _state_groups(scene):
-        ids = [s for s, _c in states]
-        chosen = data.get(group)
-        if chosen not in ids:
-            # fall back to whatever is actually render-visible, else the first
-            visible = [s for s, c in states if not c.hide_render]
-            chosen = visible[0] if visible else (ids[0] if ids else None)
-        if chosen:
-            out[group] = chosen
-    return out
-
-
-def _set_active(scene, group, state_id):
-    import json
-    data = _active_states(scene)
-    data[group] = state_id
-    scene[ACTIVE_KEY] = json.dumps(data)
-
-
-def _apply_light_state(scene, state_id):
-    """Make this state live. Only its own group is touched; other groups stay as they are.
-
-    Data API only - Artist Mode locks selection and clears the active object, so anything
-    needing a selection is dead on arrival."""
-    rig = _light_rig(scene)
-    if rig is None or not state_id or state_id == "NONE":
-        return 0
-    target = None
-    for sid, col in _light_states(scene):
-        if sid == state_id:
-            target = _state_group(col)
-            break
-    if target is None:
-        return 0
-    _set_active(scene, target, state_id)
-    group_ids = {sid for sid, col in _light_states(scene) if _state_group(col) == target}
-    seen = 0
-    for col in rig.children:
-        name = col.name
-        if name.startswith(STATE_PREFIX):
-            sid = name[len(STATE_PREFIX):]
-        elif name.startswith(PROBE_PREFIX):
-            sid = name[len(PROBE_PREFIX):]
-        else:
-            continue
-        if sid == ALWAYS_STATE:
-            col.hide_render = False
-            _hide_layer_everywhere(name, False)
-            continue
-        if sid not in group_ids:
-            continue                      # another group's business
-        on = sid == state_id
-        col.hide_render = not on
-        _hide_layer_everywhere(name, not on)
-        if name.startswith(STATE_PREFIX):
-            seen += 1
-    _apply_faders(scene)
-    return seen
-
-
-def _state_light_objects(scene, state_id=None):
-    """Every light that is actually contributing: _always, plus the live state of every group.
-
-    With interior and exterior as separate groups a render has more than one state live, so a
-    fader, a bake stamp or a level read that only looked at one of them would be wrong."""
-    ids = set(_active_states(scene).values())
-    if state_id:
-        ids.add(state_id)
-    ids.add(ALWAYS_STATE)
-    out, seen = [], set()
-    for sid in sorted(ids):
-        col = _state_col(scene, sid)
-        if col is None:
-            continue
-        for ob in col.all_objects:
-            if ob.type == "LIGHT" and ob.data and ob.name not in seen:
-                seen.add(ob.name)
-                out.append(ob)
-    return out
-
-
-def _has_energy_driver(light_data):
-    ad = getattr(light_data, "animation_data", None)
-    if not ad:
-        return False
-    return any(d.data_path == "energy" for d in ad.drivers)
-
-
-def _light_role(ob):
-    """The fader this light answers to. Guessed once from type and energy, then written down
-    so it can be corrected - a guess that is never recorded is a guess made again every time."""
-    role = ob.get(ROLE_KEY)
-    if role in {r[0] for r in LIGHT_ROLES}:
-        return role
-    li = ob.data
-    name = ob.name.lower()
-    # what the artist called it beats what the numbers suggest: "Key" on a 2 W area light is
-    # a deliberate cheat, and the energy heuristic alone would file it as a practical
-    if "key" in name:
-        role = "KEY"
-    elif "fill" in name:
-        role = "FILL"
-    elif "ambient" in name or "sky" in name or "bounce" in name:
-        role = "AMBIENT"
-    elif any(w in name for w in ("tube", "bulb", "lamp", "practical", "fitting", "light bulb")):
-        role = "PRACTICAL"
-    elif li.type == "SUN":
-        role = "KEY"
-    elif li.type == "AREA" and li.energy >= 100.0:
-        role = "KEY"
-    elif li.type in {"POINT", "SPOT"} and li.energy <= 60.0:
-        role = "PRACTICAL"
-    elif li.type == "AREA":
-        role = "PRACTICAL"
-    else:
-        role = "OTHER"
-    ob[ROLE_KEY] = role
-    return role
-
-
-def _apply_faders(scene):
-    """Faders never scale the live value.
-
-    The authored energy is kept on the object as bb_lgt_base_energy and the fader computes
-    base * gain every time. Scaling in place compounds and is unrecoverable after two drags -
-    on a project that has already lost a 25 W tube light between two saves, that is not a risk
-    worth taking.
-
-    Where a driver owns the energy - anything the time of day rig drives - writing energy would
-    be pointless anyway: a driver overwrites a direct write and the raw property reverts. Those
-    lights get the gain as a custom property instead, for the driver expression to multiply by."""
-    p = scene.bb_sv
-    gains = {"KEY": p.fader_key, "FILL": p.fader_fill, "PRACTICAL": p.fader_practical,
-             "AMBIENT": p.fader_ambient, "OTHER": p.fader_other}
-    for ob in _state_light_objects(scene, p.light_state):
-        gain = gains.get(_light_role(ob), 1.0)
-        ob[GAIN_KEY] = gain
-        if _has_energy_driver(ob.data):
-            continue
-        base = ob.get(BASE_KEY)
-        if base is None:
-            base = ob.data.energy
-            ob[BASE_KEY] = base
-        ob.data.energy = float(base) * gain
-    scene.update_tag()
-
-
-def _apply_tod(scene, value):
-    """One scene property drives every SCRIPTED driver in the rig."""
-    scene[TOD_KEY] = float(value)
-    scene.update_tag()
-    vl = getattr(bpy.context, "view_layer", None)
-    if vl is not None:
-        vl.update()
-
-
-def _bake_stamp(scene, state_id):
-    """What this state's bake was made from. A bake goes stale silently and then renders a
-    plausible wrong image, so the stamp covers the lights, the emissive materials, the world,
-    the time of day AND a signature of the host geometry - move a wall and the bounce is wrong
-    while a lights-only hash still matches."""
-    import hashlib
-    h = hashlib.sha256()
-    for ob in sorted(_state_light_objects(scene, state_id), key=lambda o: o.name):
-        li = ob.data
-        h.update(("%s|%s|%.6f|%.5f,%.5f,%.5f|%.2f|%s|%.5f|" % (
-            ob.name, li.type, li.energy, li.color[0], li.color[1], li.color[2],
-            getattr(li, "temperature", 0.0), bool(getattr(li, "use_temperature", False)),
-            getattr(li, "size", 0.0))).encode("utf-8"))
-        h.update(("".join("%.5f," % v for row in ob.matrix_world for v in row)).encode("utf-8"))
-    for mat in sorted(bpy.data.materials, key=lambda m: m.name):
-        tree = getattr(mat, "node_tree", None)
-        if tree is None:
-            continue
-        for node in tree.nodes:
-            if node.type == "EMISSION":
-                c = node.inputs["Color"].default_value
-                h.update(("%s|%.5f|%.4f,%.4f,%.4f|" % (mat.name,
-                         node.inputs["Strength"].default_value, c[0], c[1], c[2])).encode("utf-8"))
-    world = scene.world
-    if world is not None and world.node_tree is not None:
-        for node in world.node_tree.nodes:
-            for inp in node.inputs:
-                val = getattr(inp, "default_value", None)
-                if isinstance(val, float):
-                    h.update(("%s.%s=%.5f|" % (node.name, inp.name, val)).encode("utf-8"))
-    col = _state_col(scene, state_id)
-    h.update(("tod=%.4f|off=%s|" % (scene.get(TOD_KEY, 12.0),
-             col.get(OFFSET_KEY) if col else None)).encode("utf-8"))
-    obs = scene.collection.all_objects
-    total = 0.0
-    for ob in obs:
-        loc = ob.location
-        total += loc[0] + loc[1] + loc[2]
-    h.update(("geo=%d:%.4f" % (len(obs), total)).encode("utf-8"))
-    return h.hexdigest()
-
-
-_STALE = {"at": 0.0, "scene": "", "ids": set()}
-
-
-def _stale_states(scene):
-    """Which states have a bake that no longer matches. Throttled: the stamp walks every object
-    in the scene and the panel redraws constantly."""
-    import time
-    now = time.monotonic()
-    if _STALE["scene"] == scene.name and now - _STALE["at"] < 1.5:
-        return _STALE["ids"]
-    ids = set()
-    for sid, col in _light_states(scene):
-        stamp = col.get(STAMP_KEY)
-        if not stamp:
-            continue                       # never baked is not the same as stale
-        if stamp != _bake_stamp(scene, sid):
-            ids.add(sid)
-    _STALE.update(at=now, scene=scene.name, ids=ids)
-    return ids
-
-
 class BBSV_OT_set_setup(Operator):
     """Put the set into this saved lighting setup"""
 
@@ -3934,42 +3845,11 @@ class BBSV_OT_set_setup(Operator):
         return {"FINISHED"}
 
 
-class BBSV_OT_set_light_state(Operator):
-    """Switch the set to this lighting state"""
-
-    bl_idname = "bb_sv.set_light_state"
-    bl_label = "Lighting State"
-    bl_options = {"REGISTER"}
-
-    state: StringProperty()
-
-    def execute(self, context):
-        scene = context.scene
-        p = scene.bb_sv
-        if not _apply_light_state(scene, self.state):
-            self.report({"WARNING"}, "No lighting states under '%s'" % LIGHT_RIG)
-            return {"CANCELLED"}
-        if p.light_state != self.state:
-            p["light_state"] = _state_index(scene, self.state)   # no second _apply
-        col = _state_col(scene, self.state)
-        if p.tod_follow and col is not None and col.get(OFFSET_KEY) is not None:
-            p.tod = float(col[OFFSET_KEY])
-        _flash(self.state.replace("_", " ").title())
-        return {"FINISHED"}
-
-
-def _state_index(scene, state_id):
-    for i, (sid, _col) in enumerate(_light_states(scene)):
-        if sid == state_id:
-            return i
-    return 0
-
-
 class BBSV_OT_light_state_hotkey(Operator):
-    """Pick a lighting state with shift and a number (Artist and Easy Mode shortcut)"""
+    """Pick a BB Lighting setup with shift and a number (Artist and Easy Mode shortcut)"""
 
     bl_idname = "bb_sv.light_state_hotkey"
-    bl_label = "Lighting State"
+    bl_label = "Lighting Setup"
     bl_options = {"INTERNAL"}
 
     index: IntProperty()
@@ -3980,156 +3860,9 @@ class BBSV_OT_light_state_hotkey(Operator):
 
     def execute(self, context):
         setups = _setups()
-        if setups:
-            if self.index >= len(setups):
-                return {"CANCELLED"}
-            return bpy.ops.bb_sv.set_setup(name=setups[self.index])
-        states = _light_states(context.scene)
-        if self.index >= len(states):
+        if self.index >= len(setups):
             return {"CANCELLED"}
-        return bpy.ops.bb_sv.set_light_state(state=states[self.index][0])
-
-
-class BBSV_OT_tod_nudge(Operator):
-    """Move the time of day by half an hour"""
-
-    bl_idname = "bb_sv.tod_nudge"
-    bl_label = "Time of Day"
-    bl_options = {"INTERNAL"}
-
-    delta: FloatProperty(default=0.5)
-
-    @classmethod
-    def poll(cls, context):
-        return _ARTIST["on"]
-
-    def execute(self, context):
-        p = context.scene.bb_sv
-        p.tod = min(24.0, max(0.0, p.tod + self.delta))
-        _flash("%02d:%02d" % (int(p.tod), int(round((p.tod % 1.0) * 60))))
-        return {"FINISHED"}
-
-
-class BBSV_OT_tag_light_role(Operator):
-    """Put every light in this state on a fader, writing down what it was given"""
-
-    bl_idname = "bb_sv.tag_light_role"
-    bl_label = "Tag Lights"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        scene = context.scene
-        n = 0
-        for ob in _state_light_objects(scene, scene.bb_sv.light_state):
-            _light_role(ob)
-            if ob.get(BASE_KEY) is None:
-                ob[BASE_KEY] = ob.data.energy
-            n += 1
-        self.report({"INFO"}, "Tagged %d light(s)" % n)
-        return {"FINISHED"}
-
-
-def _probe_object(scene, state_id):
-    col = _state_col(scene, state_id, PROBE_PREFIX)
-    if col is None:
-        return None
-    for ob in col.all_objects:
-        if ob.type == "LIGHT_PROBE":
-            return ob
-    return None
-
-
-def _bake_one(context, state_id):
-    """Bake this state's probe, and only this state's.
-
-    subset='ACTIVE', never 'ALL': each state needs its own cache, and baking them together
-    gives every probe the same lighting. Verified that per-state caches coexist, survive save
-    and reload bit-identically, and switch with no re-bake."""
-    scene = context.scene
-    probe = _probe_object(scene, state_id)
-    if probe is None:
-        return False, "no %s%s probe" % (PROBE_PREFIX, state_id)
-    _apply_light_state(scene, state_id)
-    rig = _light_rig(scene)
-    locked = []
-    if rig is not None:
-        for col in [rig] + list(rig.children_recursive):
-            if col.hide_select:
-                col.hide_select = False
-                locked.append(col)
-    keep_active = context.view_layer.objects.active
-    try:
-        context.view_layer.objects.active = probe
-        bpy.ops.object.lightprobe_cache_bake(subset="ACTIVE")
-    except Exception as exc:
-        return False, str(exc)
-    finally:
-        context.view_layer.objects.active = keep_active
-        for col in locked:
-            col.hide_select = True
-    col = _state_col(scene, state_id)
-    if col is not None:
-        col[STAMP_KEY] = _bake_stamp(scene, state_id)
-    _STALE["at"] = 0.0
-    return True, ""
-
-
-class BBSV_OT_bake_state(Operator):
-    """Bake the bounce for the state showing now. Without it, emissive surfaces light nothing"""
-
-    bl_idname = "bb_sv.bake_state"
-    bl_label = "Bake This State"
-    bl_options = {"REGISTER"}
-
-    state: StringProperty(default="")
-
-    @classmethod
-    def poll(cls, context):
-        return not _ARTIST.get("easy")
-
-    def execute(self, context):
-        sid = self.state or context.scene.bb_sv.light_state
-        ok, why = _bake_one(context, sid)
-        if not ok:
-            self.report({"ERROR"}, "Bake failed: %s" % why)
-            return {"CANCELLED"}
-        _flash("Baked %s" % sid.replace("_", " "), seconds=3)
-        return {"FINISHED"}
-
-
-class BBSV_OT_bake_all_states(Operator):
-    """Bake every lighting state, one at a time"""
-
-    bl_idname = "bb_sv.bake_all_states"
-    bl_label = "Bake All States"
-    bl_options = {"REGISTER"}
-
-    @classmethod
-    def poll(cls, context):
-        return not _ARTIST.get("easy")
-
-    def invoke(self, context, event):
-        return context.window_manager.invoke_confirm(self, event)
-
-    def execute(self, context):
-        import time
-        scene = context.scene
-        was = scene.bb_sv.light_state
-        states = _light_states(scene)
-        t0, done, failed = time.monotonic(), 0, []
-        for sid, _col in states:
-            ok, why = _bake_one(context, sid)
-            if ok:
-                done += 1
-            else:
-                failed.append("%s (%s)" % (sid, why))
-        _apply_light_state(scene, was)
-        msg = "%d of %d baked, %.0f s" % (done, len(states), time.monotonic() - t0)
-        if failed:
-            msg += " - failed: " + ", ".join(failed)
-        self.report({"WARNING"} if failed else {"INFO"}, msg)
-        _flash(msg, seconds=5)
-        return {"FINISHED"}
+        return bpy.ops.bb_sv.set_setup(name=setups[self.index])
 
 
 class BBSV_OT_set_engine(Operator):
@@ -4187,11 +3920,11 @@ class BBSV_OT_engine_preset(Operator):
 
 
 def _draw_lighting(lay, p, context, artist=True):
-    """The lighting desk. If an artist has to open the Outliner to change the light, this failed."""
-    scene = context.scene
+    """The setup buttons. If an artist has to open the Outliner to change the light, this failed.
 
-    # BB Lighting's saved setups win when they exist: they record what was actually set by
-    # hand, which is strictly more than the collection states below can express.
+    The buttons are BB Lighting's saved setups, drawn exactly as 2.26 drew them, then the engine
+    row in Artist Mode. The rest of the old desk is retired (see Lighting, near the top)."""
+    scene = context.scene
     setups = _setups()
     if setups:
         live = _active_setup(scene)
@@ -4207,74 +3940,15 @@ def _draw_lighting(lay, p, context, artist=True):
             note.scale_y = 0.7
             note.label(text="Saved in BB Lighting. Adjust the lights there", icon="INFO")
             note.label(text="and press Update to change one of these.")
-            lay.separator()
-            lay.label(text="Engine", icon="SCENE")
-            row = lay.row(align=True)
-            for engine in ("BLENDER_EEVEE", "CYCLES"):
-                sub = row.row(align=True)
-                sub.enabled = engine in _ENGINES["ok"]
-                op = sub.operator("bb_sv.set_engine",
-                                  text="EEVEE" if engine == "BLENDER_EEVEE" else "Cycles",
-                                  depress=scene.render.engine == engine)
-                op.engine = engine
-            row.operator("bb_sv.engine_preset", text="", icon="PRESET")
-        return
-
-    states = _light_states(scene)
-    if not states:
+    else:
         box = lay.box()
         box.scale_y = 0.8
-        box.label(text="No lighting states in this set", icon="LIGHT")
-        box.label(text="Make collections under '%s' named" % LIGHT_RIG)
-        box.label(text="'%snight', '%sday' and so on." % (STATE_PREFIX, STATE_PREFIX))
-        return
-    stale = _stale_states(scene)
-    live = _active_states(scene)
-    groups = _state_groups(scene)
-    for group, members in groups:
-        if group:
-            row = lay.row()
-            row.scale_y = 0.7
-            row.label(text=group.upper(), icon="OUTLINER_COLLECTION")
-        grid = lay.grid_flow(row_major=True, columns=2, even_columns=True, align=True)
-        grid.scale_y = 1.4
-        for sid, col in members:
-            # inside a group the group name is noise: "int_night" reads as "Night" under INT
-            short = sid[len(group) + 1:] if group and sid.startswith(group + "_") else sid
-            label = short.replace("_", " ").title()
-            if sid in stale:
-                label += "  *"
-            op = grid.operator("bb_sv.set_light_state", text=label,
-                               depress=live.get(group) == sid,
-                               icon="LIGHT_SUN" if col.get(STAMP_KEY) else "LIGHT")
-            op.state = sid
-    if stale:
-        row = lay.row()
-        row.scale_y = 0.7
-        row.label(text="*  bake no longer matches the lights", icon="ERROR")
-
-    lay.prop(p, "tod", slider=True,
-             text="Time of Day   %02d:%02d" % (int(p.tod), int(round((p.tod % 1.0) * 60))))
+        box.label(text="No lighting setups saved in this set", icon="LIGHT")
+        if artist:
+            box.label(text="Light it in the BB Light tab of normal Blender")
+            box.label(text="and press Save Current Lighting there.")
     if not artist:
         return
-
-    col = lay.column(align=True)
-    col.prop(p, "tod_follow")
-    col.prop(p, "key_is_sun")
-
-    lay.separator()
-    box = lay.column(align=True)
-    box.label(text="Levels", icon="MOD_HUE_SATURATION")
-    for key in ("fader_key", "fader_fill", "fader_practical", "fader_ambient", "fader_other"):
-        box.prop(p, key, slider=True)
-    box.operator("bb_sv.tag_light_role", text="Re-read Lights", icon="FILE_REFRESH")
-
-    lay.separator()
-    row = lay.row(align=True)
-    row.scale_y = 1.2
-    row.operator("bb_sv.bake_state", text="Bake This State", icon="OUTLINER_OB_LIGHTPROBE")
-    row.operator("bb_sv.bake_all_states", text="Bake All", icon="RENDERLAYERS")
-
     lay.separator()
     lay.label(text="Engine", icon="SCENE")
     row = lay.row(align=True)
@@ -4286,10 +3960,6 @@ def _draw_lighting(lay, p, context, artist=True):
                           depress=scene.render.engine == engine)
         op.engine = engine
     row.operator("bb_sv.engine_preset", text="", icon="PRESET")
-    note = lay.column(align=True)
-    note.scale_y = 0.7
-    note.label(text="Cycles is for judging, not the same room at higher", icon="INFO")
-    note.label(text="quality - it renders emissive states differently.")
 
 
 CLASSES = (
@@ -4307,6 +3977,8 @@ CLASSES = (
     BBSV_OT_camera_view,
     BBSV_OT_set_look,
     BBSV_OT_toggle_part,
+    BBSV_OT_detail_level,
+    BBSV_OT_detail_toggle,
     BBSV_OT_artist_enter,
     BBSV_OT_artist_exit,
     BBSV_OT_switch_mode,
@@ -4330,12 +4002,7 @@ CLASSES = (
     BBSV_OT_easy_depth,
     BBSV_OT_easy_depth_multiply,
     BBSV_OT_set_setup,
-    BBSV_OT_set_light_state,
     BBSV_OT_light_state_hotkey,
-    BBSV_OT_tod_nudge,
-    BBSV_OT_tag_light_role,
-    BBSV_OT_bake_state,
-    BBSV_OT_bake_all_states,
     BBSV_OT_set_engine,
     BBSV_OT_engine_preset,
     BBSV_PT_easy,
@@ -4345,6 +4012,7 @@ CLASSES = (
     BBSV_PT_cameras,
     BBSV_PT_camera_settings,
     BBSV_PT_parts,
+    BBSV_PT_detail,
     BBSV_PT_lighting,
     BBSV_PT_settings,
 )
