@@ -83,6 +83,13 @@ v2.16 (3 Oct 2026): both modes open in Fast, not Preview. Material Preview compi
 v2.17 (3 Oct 2026): a Play button in both modes, for mocap takes and anything else keyframed.
      Both modes hide Blender's timeline, so there was no way to start playback from inside
      them. It appears only when the scene has something animated.
+v2.30 (17 Nov 2026): Props on / off, in every mode (the Detail panel). Two buttons: "Props on set" (the
+     props that stood on the studio set when the scene was shot) and "Decor props" (set dressing added
+     in 3D: the houses' props tiers, story props, decor). Each hides its collections in the view AND in
+     renders and captures, so a clean plate is one click. A set file says which collections are which
+     with a custom property on the collection: bb_props = "set" or "decor". A file without the tags
+     falls back to names ("studio propping" = on set; "· 2 Props", "Story Props", "Props & Decor",
+     "_Heavy props" = decor).
 v2.29 (17 Nov 2026): Backdrop, in Easy Mode and Artist Mode. Load any image (a set photo, a
      frame, a storyboard) behind or over the camera's view, set its opacity, put it in front of or
      behind the set, choose Fit / Fill / Stretch, and Match Frame to Image gives the camera the
@@ -161,7 +168,7 @@ from mathutils import Euler, Matrix, Vector
 bl_info = {
     "name": "BB Set Viewer",
     "author": "Beta Builder",
-    "version": (2, 29, 0),
+    "version": (2, 30, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > BB Set",
     "description": "Game-style WASD navigation and panel-driven camera control",
@@ -3772,7 +3779,12 @@ def _detail_info(context):
         lcs = _layer_colls_named(vl.layer_collection, name)
         info[flag] = bool(lcs)
         info[flag + "_hidden"] = bool(lcs) and all(lc.hide_viewport for lc in lcs)
-    info["any"] = bool(info["tiers"] or info["gully"] or info["heavy"])
+    for kind, _l, _d in PROP_KINDS:
+        lcs = _prop_layers(vl, kind)
+        info["props_" + kind] = len(lcs)
+        info["props_" + kind + "_hidden"] = _props_hidden(lcs)
+    info["any"] = bool(info["tiers"] or info["gully"] or info["heavy"]
+                       or any(info["props_" + k] for k, _l, _d in PROP_KINDS))
     _DETAIL.update(key=key, at=now, info=info)
     return info
 
@@ -3831,6 +3843,74 @@ class BBSV_OT_detail_toggle(Operator):
         return {"FINISHED"}
 
 
+# ---------------------------------------------------------------------------
+# Props on / off (v2.30): "on set" props and "decor" props, view AND render
+# ---------------------------------------------------------------------------
+PROP_KINDS = (  # key, button label, tooltip
+    ("set", "Props on set", "The props that stood on the studio set when the scene was shot"),
+    ("decor", "Decor props", "Set dressing added in 3D: house props, story props, decor"),
+)
+PROP_TAG = "bb_props"
+PROP_NAME_FALLBACK = {
+    "set": ("studio propping",),
+    "decor": (" · 2 Props", "Story Props", "Props & Decor", "_Heavy props"),
+}
+
+
+def _prop_layers(view_layer, kind):
+    """Top-most layer collections of this kind (tagged bb_props, else by name). Nested matches are
+    left out: hiding the parent hides them already."""
+    root = view_layer.layer_collection
+    tagged = any(c.get(PROP_TAG) == kind for c in bpy.data.collections)
+    out, stack = [], [root]
+    while stack:
+        lc = stack.pop()
+        c = lc.collection
+        if lc is not root:
+            if tagged:
+                hit = c.get(PROP_TAG) == kind
+            else:
+                hit = any(k.lower() in c.name.lower() for k in PROP_NAME_FALLBACK[kind])
+            if hit and not lc.exclude:
+                out.append(lc)
+                continue
+        stack.extend(lc.children)
+    return out
+
+
+def _props_hidden(lcs):
+    return bool(lcs) and all(lc.hide_viewport and lc.collection.hide_render for lc in lcs)
+
+
+class BBSV_OT_props_toggle(Operator):
+    """Show or hide these props in the view AND in renders and captures"""
+
+    bl_idname = "bb_sv.props_toggle"
+    bl_label = "Props On / Off"
+    bl_options = {"REGISTER", "UNDO"}
+
+    kind: StringProperty(default="set")
+
+    @classmethod
+    def description(cls, context, props):
+        return next((d for k, _l, d in PROP_KINDS if k == props.kind), cls.__doc__) + \
+            " - hidden in the view, in renders and in captures"
+
+    def execute(self, context):
+        lcs = _prop_layers(context.view_layer, self.kind)
+        if not lcs:
+            self.report({"INFO"}, "This set has no %s props" % self.kind)
+            return {"CANCELLED"}
+        hide = not _props_hidden(lcs)
+        for lc in lcs:
+            lc.hide_viewport = hide
+            lc.collection.hide_render = hide
+        _DETAIL["info"] = None
+        label = next(l for k, l, _d in PROP_KINDS if k == self.kind)
+        _flash("%s %s" % (label, "off" if hide else "on"))
+        return {"FINISHED"}
+
+
 class BBSV_PT_detail(Panel):
     """How much of the set is drawn. In every mode - Artist, Easy and normal Blender - because a
     heavy gully is heavy for whoever is walking it."""
@@ -3868,6 +3948,19 @@ class BBSV_PT_detail(Panel):
                 hidden = info[flag + "_hidden"]
                 col.operator("bb_sv.detail_toggle", text=label, depress=not hidden,
                              icon="HIDE_ON" if hidden else "HIDE_OFF").name = name
+        if any(info["props_" + k] for k, _l, _d in PROP_KINDS):
+            box = lay.box()
+            row = box.row()
+            row.scale_y = 0.8
+            row.label(text="Props (view and render)", icon="PACKAGE")
+            row = box.row(align=True)
+            row.scale_y = 1.3
+            for kind, label, _d in PROP_KINDS:
+                if not info["props_" + kind]:
+                    continue
+                hidden = info["props_" + kind + "_hidden"]
+                row.operator("bb_sv.props_toggle", text=label, depress=not hidden,
+                             icon="HIDE_ON" if hidden else "HIDE_OFF").kind = kind
 
 
 class BBSV_PT_lighting(_BBPanel, Panel):
@@ -4182,6 +4275,7 @@ CLASSES = (
     BBSV_OT_light_state_hotkey,
     BBSV_OT_set_engine,
     BBSV_OT_engine_preset,
+    BBSV_OT_props_toggle,
     BBSV_OT_backdrop_load,
     BBSV_OT_backdrop_match_aspect,
     BBSV_OT_backdrop_remove,
