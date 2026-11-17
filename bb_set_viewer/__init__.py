@@ -83,6 +83,11 @@ v2.16 (3 Oct 2026): both modes open in Fast, not Preview. Material Preview compi
 v2.17 (3 Oct 2026): a Play button in both modes, for mocap takes and anything else keyframed.
      Both modes hide Blender's timeline, so there was no way to start playback from inside
      them. It appears only when the scene has something animated.
+v2.29 (17 Nov 2026): Backdrop, in Easy Mode and Artist Mode. Load any image (a set photo, a
+     frame, a storyboard) behind or over the camera's view, set its opacity, put it in front of or
+     behind the set, choose Fit / Fill / Stretch, and Match Frame to Image gives the camera the
+     image's shape, so the shot can be lined up on it. It is Blender's own camera background image
+     on the active camera: it shows only through the camera and never lands in a capture or render.
 v2.28 (13 Nov 2026): Render is a real render now. The Render view shows Material Preview with the
      set's own lights on (fast to walk around in), and Capture in that view - Easy Mode and Artist
      Mode's Render Still - starts a Cycles render of the shot: 1024 samples, denoised, GPU when
@@ -156,7 +161,7 @@ from mathutils import Euler, Matrix, Vector
 bl_info = {
     "name": "BB Set Viewer",
     "author": "Beta Builder",
-    "version": (2, 28, 0),
+    "version": (2, 29, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > BB Set",
     "description": "Game-style WASD navigation and panel-driven camera control",
@@ -3036,6 +3041,162 @@ class BBSV_OT_easy_depth_multiply(Operator):
         return {"FINISHED"}
 
 
+# ---------------------------------------------------------------------------
+# Backdrop: an image over or behind the camera's view, to line a shot up on
+# ---------------------------------------------------------------------------
+
+BACKDROP_TAG = "bb_sv_backdrop"     # custom property on the camera data: which slot is ours
+
+
+def _backdrop(cam):
+    """The camera's backdrop slot (Blender's own background image), or None."""
+    if cam is None or cam.type != "CAMERA":
+        return None
+    bgs = cam.data.background_images
+    i = cam.data.get(BACKDROP_TAG, -1)
+    if 0 <= i < len(bgs):
+        return bgs[i]
+    return bgs[0] if len(bgs) else None
+
+
+def _look_through(context, cam):
+    """Put the main 3D view into this camera, so the backdrop is visible."""
+    area = _view3d_area(context)
+    if area is None:
+        return
+    space = area.spaces.active
+    if context.scene.camera is not cam:
+        context.scene.camera = cam
+    space.region_3d.view_perspective = "CAMERA"
+    space.overlay.show_overlays = True       # camera background images are drawn as an overlay
+
+
+class BBSV_OT_backdrop_load(Operator):
+    """Pick an image to show behind or over this camera's view, to match the shot to it"""
+
+    bl_idname = "bb_sv.backdrop_load"
+    bl_label = "Load Backdrop Image"
+    bl_options = {"REGISTER", "UNDO"}
+
+    filepath: StringProperty(subtype="FILE_PATH")
+    filter_image: BoolProperty(default=True, options={"HIDDEN", "SKIP_SAVE"})
+    filter_folder: BoolProperty(default=True, options={"HIDDEN", "SKIP_SAVE"})
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        cam = _active_cam(context)
+        if cam is None:
+            self.report({"WARNING"}, "Add or pick a camera first")
+            return {"CANCELLED"}
+        try:
+            img = bpy.data.images.load(self.filepath, check_existing=True)
+        except (RuntimeError, OSError) as e:
+            self.report({"ERROR"}, "Could not open the image: %s" % e)
+            return {"CANCELLED"}
+        d = cam.data
+        bg = _backdrop(cam)
+        if bg is None:
+            bg = d.background_images.new()
+            bg.alpha = 0.5
+            bg.display_depth = "FRONT"
+            bg.frame_method = "FIT"
+        d[BACKDROP_TAG] = list(d.background_images).index(bg)
+        bg.source = "IMAGE"
+        bg.image = img
+        bg.show_background_image = True
+        d.show_background_images = True
+        _look_through(context, cam)
+        _flash("Backdrop: %s" % os.path.basename(self.filepath), seconds=4)
+        return {"FINISHED"}
+
+
+class BBSV_OT_backdrop_match_aspect(Operator):
+    """Give the camera frame the backdrop image's shape (same long edge), so the image fills it"""
+
+    bl_idname = "bb_sv.backdrop_match_aspect"
+    bl_label = "Match Frame to Image"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        bg = _backdrop(_active_cam(context))
+        img = bg.image if bg else None
+        if img is None or not img.size[0] or not img.size[1]:
+            self.report({"WARNING"}, "Load a backdrop image first")
+            return {"CANCELLED"}
+        r = context.scene.render
+        long_edge = max(r.resolution_x, r.resolution_y)
+        w, h = img.size
+        s = long_edge / float(max(w, h))
+        r.resolution_x = max(2, int(round(w * s / 2.0)) * 2)
+        r.resolution_y = max(2, int(round(h * s / 2.0)) * 2)
+        _flash("Frame is now %d x %d, the image's shape" % (r.resolution_x, r.resolution_y), seconds=4)
+        return {"FINISHED"}
+
+
+class BBSV_OT_backdrop_remove(Operator):
+    """Take the backdrop image off this camera"""
+
+    bl_idname = "bb_sv.backdrop_remove"
+    bl_label = "Remove Backdrop"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        cam = _active_cam(context)
+        bg = _backdrop(cam)
+        if bg is None:
+            return {"CANCELLED"}
+        cam.data.background_images.remove(bg)
+        if BACKDROP_TAG in cam.data:
+            del cam.data[BACKDROP_TAG]
+        return {"FINISHED"}
+
+
+def _draw_backdrop(lay, context):
+    """One block for both modes: load, opacity, front/back, fit, match frame, remove."""
+    cam = _active_cam(context)
+    if cam is None:
+        lay.label(text="Add a camera first", icon="INFO")
+        return
+    bg = _backdrop(cam)
+    if bg is None or bg.image is None:
+        lay.operator("bb_sv.backdrop_load", text="Load Backdrop Image", icon="IMAGE_REFERENCE")
+        sub = lay.row()
+        sub.scale_y = 0.6
+        sub.label(text="An image behind or over the shot, to match the camera to it")
+        return
+    row = lay.row(align=True)
+    row.prop(bg, "show_background_image", text="", icon="HIDE_OFF" if bg.show_background_image else "HIDE_ON")
+    row.label(text=bg.image.name, icon="IMAGE_DATA")
+    row.operator("bb_sv.backdrop_load", text="", icon="FILE_FOLDER")
+    row.operator("bb_sv.backdrop_remove", text="", icon="X")
+    col = lay.column(align=True)
+    col.enabled = bg.show_background_image
+    col.prop(bg, "alpha", text="Opacity", slider=True)
+    col.row(align=True).prop(bg, "display_depth", expand=True)
+    col.row(align=True).prop(bg, "frame_method", expand=True)
+    lay.operator("bb_sv.backdrop_match_aspect", icon="FULLSCREEN_ENTER")
+    area = _view3d_area(context)
+    if area and area.spaces.active.region_3d.view_perspective != "CAMERA":
+        lay.label(text="Look through the camera (0) to see it", icon="INFO")
+
+
+class BBSV_PT_easy_backdrop(Panel):
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "BB Set"
+    bl_label = "Backdrop"
+    bl_idname = "BBSV_PT_easy_backdrop"
+    bl_order = 5
+    bl_parent_id = "BBSV_PT_easy"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        _draw_backdrop(self.layout, context)
+
+
 class BBSV_PT_easy(Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -3489,6 +3650,22 @@ class BBSV_PT_camera_settings(_BBPanel, Panel):
         row.operator("bb_sv.level_horizon", text="Reset Horizon", icon="ALIGN_JUSTIFY")
         op = row.operator("bb_sv.nudge", text="Roll Right")
         op.axis, op.amount, op.kind = "Y", -1.0, "TILT"
+
+
+class BBSV_PT_backdrop(_BBPanel, Panel):
+    """An image behind or over the active camera's view, to line the shot up on it."""
+
+    bl_label = "Backdrop"
+    bl_idname = "BBSV_PT_backdrop"
+    bl_order = 4
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return super().poll(context) and _active_cam(context) is not None
+
+    def draw(self, context):
+        _draw_backdrop(self.layout, context)
 
 
 class BBSV_PT_parts(_BBPanel, Panel):
@@ -4005,12 +4182,17 @@ CLASSES = (
     BBSV_OT_light_state_hotkey,
     BBSV_OT_set_engine,
     BBSV_OT_engine_preset,
+    BBSV_OT_backdrop_load,
+    BBSV_OT_backdrop_match_aspect,
+    BBSV_OT_backdrop_remove,
     BBSV_PT_easy,
+    BBSV_PT_easy_backdrop,
     BBSV_PT_easy_more,
     BBSV_PT_mode,
     BBSV_PT_shot,
     BBSV_PT_cameras,
     BBSV_PT_camera_settings,
+    BBSV_PT_backdrop,
     BBSV_PT_parts,
     BBSV_PT_detail,
     BBSV_PT_lighting,
