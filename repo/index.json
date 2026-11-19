@@ -28,7 +28,7 @@
       "id": "bb_lighting",
       "name": "BB Lighting",
       "tagline": "Light a set by hand, then save and re-apply the result",
-      "version": "0.4.0",
+      "version": "0.5.0",
       "type": "add-on",
       "maintainer": "Lakao456",
       "license": [
@@ -40,9 +40,9 @@
         "3D View",
         "Lighting"
       ],
-      "archive_url": "./bb_lighting-0.4.0.zip",
-      "archive_size": 15569,
-      "archive_hash": "sha256:8b182581cbd63290bc9915e1bc0800006982659a5503b37dbb2a3a0a58583b1d"
+      "archive_url": "./bb_lighting-0.5.0.zip",
+      "archive_size": 16853,
+      "archive_hash": "sha256:9db30cf2b53f6aeefe8e033c5d6bc8628a7ae9f69272486e70e9a94c3c545538"
     },
     {
       "schema_version": "1.0.0",

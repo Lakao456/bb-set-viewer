@@ -29,6 +29,16 @@ fed by a link (a texture, a driver node) is the link's business and is not recor
 shared by several objects switches on all of them - give an object its own material if only it
 should change.
 
+v0.5.0 (19 Nov 2026): a state can now carry a whole time of day, not only the lamps. Three
+     additions, each recorded on Save / Update and left alone by states saved before 0.5.0:
+     (1) the look of the picture - Color Management's View Transform, Look, Exposure and Gamma,
+     beside the white balance, because a day and a night pass are exposed differently;
+     (2) the practicals - every object in the rig that is not a light (a sign face, a tube's glass,
+     fairy bulbs, lit window cards, a haze box) is recorded as shown or hidden, so the night-only
+     geometry goes away by day; (3) state values - any Value or RGB node, in any node group,
+     material or world, whose label starts with "STATE" is recorded (a skyline's window glow, a
+     haze colour), so a look driven by one number follows the state. Made for the Chai Tapri, whose
+     Day / Evening / Night switch carried all three and could not be expressed by lamps alone.
 v0.4.0 (26 Oct 2026): (1) 0.3.0's "looks" are now called set dressing: a collection named
      "DRESSING · Wedding" holds the props that exist only in that state (Aman: the universal part
      is a collection of the props a state needs; Wedding itself belongs to Jai's House alone).
@@ -80,7 +90,7 @@ from bpy.types import Operator, Panel, PropertyGroup
 bl_info = {
     "name": "BB Lighting",
     "author": "Beta Builder",
-    "version": (0, 4, 0),
+    "version": (0, 5, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > BB Light",
     "description": "Light a set by hand and save the result as a named, re-applicable state",
@@ -109,7 +119,11 @@ LIGHT_FIELDS = (
 # The scene's colour temperature: Render Properties > Color Management > White Balance.
 # The whitepoint colour Blender also shows is worked out from these two, so it is not stored.
 VIEW_KEY = "view"
-VIEW_FIELDS = ("use_white_balance", "white_balance_temperature", "white_balance_tint")
+VIEW_FIELDS = ("use_white_balance", "white_balance_temperature", "white_balance_tint",
+               "view_transform", "look", "exposure", "gamma")     # 0.5.0: the picture's look too (transform before look)
+PRACTICALS_KEY = "practicals"          # 0.5.0: shown / hidden of the rig's non-light objects
+STATE_NODES_KEY = "state_nodes"        # 0.5.0: Value / RGB nodes labelled "STATE ..."
+STATE_LABEL = "STATE"
 
 
 # ---------------------------------------------------------------------------
@@ -536,7 +550,12 @@ def _view_snapshot(scene):
     for attr in VIEW_FIELDS:
         if hasattr(vs, attr):
             val = getattr(vs, attr)
-            out[attr] = bool(val) if isinstance(val, bool) else float(val)
+            if isinstance(val, bool):
+                out[attr] = bool(val)
+            elif isinstance(val, str):
+                out[attr] = val
+            else:
+                out[attr] = float(val)
     return out
 
 
@@ -548,7 +567,11 @@ def _view_restore(scene, rec):
         if attr in rec and hasattr(vs, attr):
             try:
                 cur = getattr(vs, attr)
-                setattr(vs, attr, bool(rec[attr]) if isinstance(cur, bool) else type(cur)(rec[attr]))
+                if isinstance(cur, str):
+                    if cur != rec[attr]:
+                        setattr(vs, attr, str(rec[attr]))
+                else:
+                    setattr(vs, attr, bool(rec[attr]) if isinstance(cur, bool) else type(cur)(rec[attr]))
                 done += 1
             except Exception as exc:
                 print("BB Lighting: view %s -> %r failed (%s)" % (attr, rec[attr], exc))
@@ -593,7 +616,93 @@ def _capture(scene):
     snap.update(_world_snapshot(scene))
     snap["materials"] = _capture_materials(scene)
     snap[VIEW_KEY] = _view_snapshot(scene)
+    snap[PRACTICALS_KEY] = _capture_practicals(scene)
+    snap[STATE_NODES_KEY] = _capture_state_nodes()
     return snap
+
+
+# ---------------------------------------------------------------------------
+# 0.5.0: practicals (the rig's non-light objects) and STATE-labelled nodes
+# ---------------------------------------------------------------------------
+
+def _practicals(scene):
+    """The rig's objects that are not lights: glowing meshes, fittings, wires, volumes. Only with a rig -
+    without one, 'every object in the scene' would be the whole set."""
+    rig = _rig(scene)
+    if rig is None:
+        return []
+    return sorted((ob for ob in rig.all_objects if ob is not None and ob.type != "LIGHT"), key=lambda o: o.name)
+
+
+def _capture_practicals(scene):
+    return {ob.name: {"hide_render": bool(ob.hide_render), "hide_viewport": bool(ob.hide_viewport)}
+            for ob in _practicals(scene)}
+
+
+def _apply_practicals(state):
+    missing = []
+    for name, rec in (state.get(PRACTICALS_KEY) or {}).items():
+        ob = bpy.data.objects.get(name)
+        if ob is None:
+            missing.append(name)
+            continue
+        for attr in ("hide_render", "hide_viewport"):
+            if attr in rec and getattr(ob, attr) != bool(rec[attr]):
+                try:
+                    setattr(ob, attr, bool(rec[attr]))
+                except Exception as exc:
+                    print("BB Lighting: %s.%s failed (%s)" % (name, attr, exc))
+    return missing
+
+
+def _state_node_owners():
+    """(key prefix, id, node tree) for every node tree a STATE node can live in."""
+    for g in bpy.data.node_groups:
+        yield "group", g, g
+    for m in bpy.data.materials:
+        if m.node_tree is not None:
+            yield "material", m, m.node_tree
+    for w in bpy.data.worlds:
+        if w.node_tree is not None:
+            yield "world", w, w.node_tree
+
+
+def _state_nodes():
+    """{key: node} for Value and RGB nodes whose label starts with STATE."""
+    out = {}
+    for kind, idb, tree in _state_node_owners():
+        for node in tree.nodes:
+            if node.type in ("VALUE", "RGB") and node.label.upper().startswith(STATE_LABEL) and node.outputs:
+                out["%s:%s:%s" % (kind, idb.name, node.name)] = node
+    return out
+
+
+def _capture_state_nodes():
+    out = {}
+    for key, node in _state_nodes().items():
+        val = node.outputs[0].default_value
+        out[key] = [float(v) for v in val] if hasattr(val, "__len__") else float(val)
+    return out
+
+
+def _apply_state_nodes(state):
+    nodes = _state_nodes()
+    missing = []
+    for key, val in (state.get(STATE_NODES_KEY) or {}).items():
+        node = nodes.get(key)
+        if node is None:
+            missing.append("node %s" % key)
+            continue
+        cur = node.outputs[0].default_value
+        try:
+            if hasattr(cur, "__len__"):
+                for i in range(min(len(cur), len(val))):
+                    cur[i] = val[i]
+            else:
+                node.outputs[0].default_value = float(val)
+        except Exception as exc:
+            print("BB Lighting: %s failed (%s)" % (key, exc))
+    return missing
 
 
 # ---------------------------------------------------------------------------
@@ -713,6 +822,11 @@ def _apply(scene, state):
         _view_restore(scene, state[VIEW_KEY])
     else:
         extra.append("white balance")
+    # 0.5.0: practicals and STATE nodes - absent in older states, which leave them alone
+    if PRACTICALS_KEY in state:
+        missing.extend(_apply_practicals(state))
+    if STATE_NODES_KEY in state:
+        missing.extend(_apply_state_nodes(state))
     scene.update_tag()
     vl = getattr(bpy.context, "view_layer", None)
     if vl is not None:
